@@ -1,0 +1,893 @@
+---
+layout:       post
+title:        "Kubernetes网络管理"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# Kubernetes网络管理
+
+[TOC]
+
+## 资源列表
+
+| 操作系统   | 配置 | 主机名     | IP             |
+| ---------- | ---- | ---------- | -------------- |
+| CentOS 7.9 | 2C4G | k8s-master | 192.168.93.101 |
+| CentOS 7.9 | 2C4G | k8s-node01 | 192.168.93.102 |
+| CentOS 7.9 | 2C4G | k8s-node02 | 192.168.93.103 |
+
+## 基础环境
+
+- 关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+- 关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/^SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+- 修改主机名
+
+```bash
+hostnamectl set-hostname k8s-master
+hostnamectl set-hostname k8s-node01
+hostnamectl set-hostname k8s-node02
+```
+
+## 一、环境准备
+
+- <font color='red'>三台主机均要操作</font>
+
+### 1.1、绑定映射关系
+
+```bash
+[root@k8s-master ~]# cat >> /etc/hosts << EOF
+192.168.93.101 k8s-master
+192.168.93.102 k8s-node01
+192.168.93.103 k8s-node02
+EOF
+```
+
+### 1.2、安装常用软件
+
+```bash
+[root@k8s-master ~]# yum -y install vim wget net-tools lrzsz unzip
+```
+
+### 1.3、关闭swap空间
+
+```bash
+[root@k8s-master ~]# swapoff -a
+[root@k8s-master ~]# sed -i '/swap/s/^/#/' /etc/fstab 
+[root@k8s-master ~]# tail -1 /etc/fstab 
+#/dev/mapper/centos-swap swap                    swap    defaults        0 0
+```
+
+### 1.4、时间同步
+
+```bash
+[root@k8s-node01 ~]# yum -y install ntpdate && ntpdate ntp.aliyun.com
+```
+
+## 二、部署Docker环境
+
+- <font color='red'>三台主机均要操作</font>
+
+```bash
+[root@k8s-master ~]# yum -y install yum-utils device-mapper-persistent-data lvm2
+[root@k8s-master ~]# yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+[root@k8s-master ~]# yum makecache fast
+
+
+# 安装指定版本的Docker（k8s和Docker的版本有非常严格的要求）
+[root@k8s-master ~]# yum -y install docker-ce-19.03.15 docker-ce-cli-19.03.15
+
+
+# 使用以下命令永久开启和开启Docker
+[root@k8s-master ~]# systemctl enable docker --now
+
+
+# 配置镜像加速， 以下设置了cgroup驱动和阿里云加速器地址
+[root@k8s-master ~]# vim /etc/docker/daemon.json
+{  
+  "exec-opts": ["native.cgroupdriver=systemd"],  
+  "registry-mirrors": ["https://u9noolvn.mirror.aliyuncs.com"]  
+}
+[root@k8s-master ~]# systemctl daemon-reload 
+[root@k8s-master ~]# systemctl restart docker
+
+
+# 配置内核参数
+[root@k8s-master ~]# cat >> /etc/sysctl.conf << EOF
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+EOF
+
+
+# 往内核中加载模块
+[root@k8s-master ~]# modprobe br_netfilter
+[root@k8s-master ~]# sysctl -p
+```
+
+## 三、部署Kuberenetes集群
+
+- 准备好基础环境和Docker环境，下面就开始通过Kubeadm来部署Kubernetes集群。首先，<font color='red'>三台主机</font>安装Kubelet、Kubeadm、Kubectl
+- kubectl：命令行管理工具
+- kubeadm：安装K8S集群工具
+- kubelet：管理容器给工具
+
+### 3.1、配置Kubernetes源
+
+```bash
+[root@k8s-master ~]# cat >> /etc/yum.repos.d/kubernetes.repo << EOF
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/  
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg \
+https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+[root@k8s-master ~]# yum makecache fast
+```
+
+### 3.2、安装Kubernetes所需工具
+
+```bash
+# 列出k8s版本信息
+[root@k8s-master ~]# yum list kubectl --showduplicates | sort -r
+
+
+# 安装指定版本
+[root@k8s-master ~]# yum install -y kubelet-1.18.0 kubeadm-1.18.0 kubectl-1.18.0
+
+
+# 设置kubelet为开机自启动（不要开启服务）
+[root@k8s-master ~]# systemctl enable kubelet.service 
+```
+
+### 3.3、生成配置文件拉取所需镜像
+
+- k8s-master节点操作
+
+```bash
+# 生成初始化配置文件
+[root@k8s-master ~]# kubeadm config print init-defaults > init-config.yaml
+W0620 08:25:39.895580    9287 configset.go:202] WARNING: kubeadm cannot validate component configs for API groups [kubelet.config.k8s.io kubeproxy.config.k8s.io]
+
+
+[root@k8s-master ~]# vim init-config.yaml 
+apiVersion: kubeadm.k8s.io/v1beta2
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  token: abcdef.0123456789abcdef
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 192.168.93.101   # master节点的IP地址
+  bindPort: 6443
+nodeRegistration:
+  criSocket: /var/run/dockershim.sock
+  name: k8s-master   # 如果使用域名保证可以解析，或直接使用IP地址
+  taints:
+  - effect: NoSchedule
+    key: node-role.kubernetes.io/master
+---
+apiServer:
+  timeoutForControlPlane: 4m0s
+apiVersion: kubeadm.k8s.io/v1beta2
+certificatesDir: /etc/kubernetes/pki
+clusterName: kubernetes
+controllerManager: {}
+dns:
+  type: CoreDNS
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+imageRepository: registry.aliyuncs.com/google_containers  # 更改为阿里云镜像
+kind: ClusterConfiguration
+kubernetesVersion: v1.18.0
+networking:
+  dnsDomain: cluster.local
+  serviceSubnet: 10.96.0.0/12
+  podSubnet: 10.244.0.0/16   # podSubnet地址不能与主机物理地址设置为同一网段
+scheduler: {}
+
+
+# 查看所需镜像
+[root@k8s-master ~]# kubeadm config images list --config init-config.yaml 
+W0620 08:28:04.815219    9306 configset.go:202] WARNING: kubeadm cannot validate component configs for API groups [kubelet.config.k8s.io kubeproxy.config.k8s.io]
+registry.aliyuncs.com/google_containers/kube-apiserver:v1.18.0
+registry.aliyuncs.com/google_containers/kube-controller-manager:v1.18.0
+registry.aliyuncs.com/google_containers/kube-scheduler:v1.18.0
+registry.aliyuncs.com/google_containers/kube-proxy:v1.18.0
+registry.aliyuncs.com/google_containers/pause:3.2
+registry.aliyuncs.com/google_containers/etcd:3.4.3-0
+registry.aliyuncs.com/google_containers/coredns:1.6.7
+
+
+# 拉取所需镜像
+[root@k8s-master ~]# kubeadm config images pull --config=init-config.yaml
+W0620 08:28:38.237777    9312 configset.go:202] WARNING: kubeadm cannot validate component configs for API groups [kubelet.config.k8s.io kubeproxy.config.k8s.io]
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-apiserver:v1.18.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-controller-manager:v1.18.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-scheduler:v1.18.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-proxy:v1.18.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/pause:3.2
+[config/images] Pulled registry.aliyuncs.com/google_containers/etcd:3.4.3-0
+[config/images] Pulled registry.aliyuncs.com/google_containers/coredns:1.6.7
+```
+
+### 3.4、master节点初始化
+
+```bash
+[root@k8s-master ~]# kubeadm init --config=init-config.yaml
+W0620 08:30:29.869197    9486 configset.go:202] WARNING: kubeadm cannot validate component configs for API groups [kubelet.config.k8s.io kubeproxy.config.k8s.io]
+[init] Using Kubernetes version: v1.18.0
+[preflight] Running pre-flight checks
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[preflight] This might take a minute or two, depending on the speed of your internet connection
+[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Starting the kubelet
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "ca" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [k8s-master kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local] and IPs [10.96.0.1 192.168.93.101]
+[certs] Generating "apiserver-kubelet-client" certificate and key
+[certs] Generating "front-proxy-ca" certificate and key
+[certs] Generating "front-proxy-client" certificate and key
+[certs] Generating "etcd/ca" certificate and key
+[certs] Generating "etcd/server" certificate and key
+[certs] etcd/server serving cert is signed for DNS names [k8s-master localhost] and IPs [192.168.93.101 127.0.0.1 ::1]
+[certs] Generating "etcd/peer" certificate and key
+[certs] etcd/peer serving cert is signed for DNS names [k8s-master localhost] and IPs [192.168.93.101 127.0.0.1 ::1]
+[certs] Generating "etcd/healthcheck-client" certificate and key
+[certs] Generating "apiserver-etcd-client" certificate and key
+[certs] Generating "sa" key and public key
+[kubeconfig] Using kubeconfig folder "/etc/kubernetes"
+[kubeconfig] Writing "admin.conf" kubeconfig file
+[kubeconfig] Writing "kubelet.conf" kubeconfig file
+[kubeconfig] Writing "controller-manager.conf" kubeconfig file
+[kubeconfig] Writing "scheduler.conf" kubeconfig file
+[control-plane] Using manifest folder "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+W0620 08:30:32.099248    9486 manifests.go:225] the default kube-apiserver authorization-mode is "Node,RBAC"; using "Node,RBAC"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+W0620 08:30:32.100054    9486 manifests.go:225] the default kube-apiserver authorization-mode is "Node,RBAC"; using "Node,RBAC"
+[etcd] Creating static Pod manifest for local etcd in "/etc/kubernetes/manifests"
+[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory "/etc/kubernetes/manifests". This can take up to 4m0s
+[apiclient] All control plane components are healthy after 15.002164 seconds
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[kubelet] Creating a ConfigMap "kubelet-config-1.18" in namespace kube-system with the configuration for the kubelets in the cluster
+[upload-certs] Skipping phase. Please see --upload-certs
+[mark-control-plane] Marking the node k8s-master as control-plane by adding the label "node-role.kubernetes.io/master=''"
+[mark-control-plane] Marking the node k8s-master as control-plane by adding the taints [node-role.kubernetes.io/master:NoSchedule]
+[bootstrap-token] Using token: abcdef.0123456789abcdef
+[bootstrap-token] Configuring bootstrap tokens, cluster-info ConfigMap, RBAC Roles
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to get nodes
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to post CSRs in order for nodes to get long term certificate credentials
+[bootstrap-token] configured RBAC rules to allow the csrapprover controller automatically approve CSRs from a Node Bootstrap Token
+[bootstrap-token] configured RBAC rules to allow certificate rotation for all node client certificates in the cluster
+[bootstrap-token] Creating the "cluster-info" ConfigMap in the "kube-public" namespace
+[kubelet-finalize] Updating "/etc/kubernetes/kubelet.conf" to point to a rotatable kubelet client certificate and key
+[addons] Applied essential addon: CoreDNS
+[addons] Applied essential addon: kube-proxy
+
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+####################################################################
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+####################################################################
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+Then you can join any number of worker nodes by running the following on each as root:
+####################################################################
+kubeadm join 192.168.93.101:6443 --token abcdef.0123456789abcdef \
+    --discovery-token-ca-cert-hash sha256:9999ca93cd68cfa53f3da5773752e3faf182faa3ee5b429810c461b6f18ab742 
+####################################################################
+
+
+# master节点操作
+[root@k8s-master ~]# mkdir -p $HOME/.kube
+[root@k8s-master ~]# cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@k8s-master ~]# chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+### 3.5、node节点加入集群
+
+```bash
+[root@k8s-node01 ~]# kubeadm join 192.168.93.101:6443 --token abcdef.0123456789abcdef \
+>     --discovery-token-ca-cert-hash sha256:9999ca93cd68cfa53f3da5773752e3faf182faa3ee5b429810c461b6f18ab742
+
+
+[root@k8s-node02 ~]# kubeadm join 192.168.93.101:6443 --token abcdef.0123456789abcdef \
+>     --discovery-token-ca-cert-hash sha256:9999ca93cd68cfa53f3da5773752e3faf182faa3ee5b429810c461b6f18ab742
+```
+
+### 3.6、master节点查看集群状态
+
+```bash
+[root@k8s-master ~]# kubectl get nodes
+NAME         STATUS     ROLES    AGE     VERSION
+k8s-master   NotReady   master   3m11s   v1.18.0
+k8s-node01   NotReady   <none>   59s     v1.18.0
+k8s-node02   NotReady   <none>   38s     v1.18.0
+```
+
+## 四、部署Calico网络插件
+
+- Calico网络插件是一种基于BGP的、纯三层的、容器间互通的网络方案。与Openstack、kubernetes、AWS、GCE等云平台都能够良好的集成。在虚拟化平台中，如Openstack、Docker等都需要实现workloads之间互联，但同时也需要对容器作隔离控制，就像在internet中的服务仅开放80端口、公有云的多租户一样，提供隔离和管控机制
+
+### 4.1、master上安装Calico网络插件
+
+```bash
+[root@k8s-master ~]# kubectl apply -f calico.yaml 
+configmap/calico-config created
+customresourcedefinition.apiextensions.k8s.io/bgpconfigurations.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/bgppeers.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/blockaffinities.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/caliconodestatuses.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/clusterinformations.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/felixconfigurations.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/globalnetworkpolicies.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/globalnetworksets.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/hostendpoints.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/ipamblocks.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/ipamconfigs.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/ipamhandles.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/ippools.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/ipreservations.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/kubecontrollersconfigurations.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/networkpolicies.crd.projectcalico.org created
+customresourcedefinition.apiextensions.k8s.io/networksets.crd.projectcalico.org created
+clusterrole.rbac.authorization.k8s.io/calico-kube-controllers created
+clusterrolebinding.rbac.authorization.k8s.io/calico-kube-controllers created
+clusterrole.rbac.authorization.k8s.io/calico-node created
+clusterrolebinding.rbac.authorization.k8s.io/calico-node created
+daemonset.apps/calico-node created
+serviceaccount/calico-node created
+deployment.apps/calico-kube-controllers created
+serviceaccount/calico-kube-controllers created
+poddisruptionbudget.policy/calico-kube-controllers created
+```
+
+### 4.2、查看Pod与Node
+
+```bash
+# 查看所有命名空间的Pod资源（必须所部是running）
+[root@k8s-master ~]# kubectl get pod -A
+NAMESPACE     NAME                                      READY   STATUS    RESTARTS   AGE
+kube-system   calico-kube-controllers-858fbfbc9-vrlxn   0/1     Running   3          2m53s
+kube-system   calico-node-qkvkz                         1/1     Running   0          2m53s
+kube-system   calico-node-x54lm                         1/1     Running   0          2m53s
+kube-system   calico-node-zbs6c                         1/1     Running   0          2m53s
+kube-system   coredns-7ff77c879f-8pl9d                  0/1     Running   0          11m
+kube-system   coredns-7ff77c879f-lmdk8                  0/1     Running   0          11m
+kube-system   etcd-k8s-master                           1/1     Running   0          11m
+kube-system   kube-apiserver-k8s-master                 1/1     Running   0          11m
+kube-system   kube-controller-manager-k8s-master        1/1     Running   0          11m
+kube-system   kube-proxy-758cc                          1/1     Running   0          9m47s
+kube-system   kube-proxy-flvgv                          1/1     Running   0          9m26s
+kube-system   kube-proxy-nwg7d                          1/1     Running   0          11m
+kube-system   kube-scheduler-k8s-master                 1/1     Running   0          11m
+
+
+# 查看node集群状态
+[root@k8s-master ~]# kubectl get nodes
+NAME         STATUS   ROLES    AGE   VERSION
+k8s-master   Ready    master   12m   v1.18.0
+k8s-node01   Ready    <none>   10m   v1.18.0
+k8s-node02   Ready    <none>   10m   v1.18.0
+```
+
+## 五、Calico网络策略基础
+
+### 5.1、创建服务
+
+```bash
+# 创建命名空间
+[root@k8s-master ~]# kubectl create ns policy-demo
+namespace/policy-demo created
+
+
+# 在policy-demo命名空间中创建两个副本的Nginx Pod
+[root@k8s-master ~]# kubectl run --namespace=policy-demo nginx --replicas=2 --image=nginx
+Flag --replicas has been deprecated, has no effect and will be removed in the future.
+pod/nginx created
+# 若出现如上“Flag --replicas has been deprecated, has no effect and will be removed in the future.”报错，说明所使用的K8S是v1.18.0之前的版本，而K8S v1.18.0以后的版本中--replicas已经被启用，推荐使用Deployment创建Pods
+
+
+# 创建刚刚所创建的pod
+[root@k8s-master ~]# kubectl delete pod nginx -n policy-demo
+pod "nginx" deleted
+
+
+[root@k8s-master ~]# vim nginx-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: policy-demo
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+[root@k8s-master ~]# kubectl apply -f nginx-deployment.yaml 
+deployment.apps/nginx created
+
+
+# 通过服务暴露Nginx的80端口
+[root@k8s-master ~]# kubectl expose --namespace=policy-demo deployment nginx --port=80
+service/nginx exposed
+# 查询policy-demo命名空间中的所有资源
+[root@k8s-master ~]# kubectl get all -n policy-demo
+NAME                        READY   STATUS    RESTARTS   AGE
+pod/nginx-d46f5678b-8c9br   1/1     Running   0          76s
+pod/nginx-d46f5678b-rwkrr   1/1     Running   0          76s
+
+NAME            TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
+service/nginx   ClusterIP   10.102.145.27   <none>        80/TCP    45s
+
+NAME                    READY   UP-TO-DATE   AVAILABLE   AGE
+deployment.apps/nginx   2/2     2            2           76s
+
+NAME                              DESIRED   CURRENT   READY   AGE
+replicaset.apps/nginx-d46f5678b   2         2         2       76s
+
+
+# 通过busybox的Pod去访问Nginx服务
+[root@k8s-master ~]# kubectl run --namespace=policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q nginx -O -
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+```
+
+### 5.2、启动网络隔离
+
+- 在policy-demo命名空间中打开开打隔离。然后Calico将阻止连接到该命名空间中的Pod。执行以下命令将创建一个NetworkPolicy，该策略将对policy-demo命名空间中的所有Pod实现默认的拒绝行为。
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  name: default-deny
+  namespace: policy-demo
+spec:
+  podSelector:
+    matchLabels: {}
+EOF
+networkpolicy.networking.k8s.io/default-deny created
+
+```
+
+### 5.3、测试网络隔离
+
+- 启动网络隔离后，所有对Nginx服务的访问都将阻止。执行以下命令，尝试再次访问Nginx服务，查看网络隔离的效果
+
+```bash
+[root@k8s-master ~]# kubectl run --namespace=policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+wget: download timed out    # 连接超时
+```
+
+### 5.4、允许通过网络策略进行访问
+
+- 使用NetworkPolicy启用对Nginx服务的访问。设置允许从accessPod传入的连接，但不能从其他任何地方传入。创建access-nginx的网络策略具体内容如下所示
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: access-nginx
+  namespace: policy-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: nginx
+   ingress:
+     - from:
+       - podSelector:
+           matchLabels:
+             run: access
+EOF
+networkpolicy.networking.k8s.io/access-nginx created
+
+
+# 从accessPod访问该服务
+[root@k8s-master ~]# kubectl run --namespace=policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+
+
+# 如果没有标签run: access，仍然无法访问服务
+[root@k8s-master ~]# kubectl run --namespace=policy-demo cant-access --rm -ti -image busybox /bin/sh
+Error: unknown shorthand flag: 'm' in -mage
+See 'kubectl run --help' for usage.
+[root@k8s-master ~]# kubectl run --namespace=policy-demo cant-access --rm -ti --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+wget: download timed out
+```
+
+## 六、Calico网络策略进阶
+
+### 6.1、创建服务
+
+- 删除命名空间policy-demo。创建新的命名空间advanced-policy-demo
+
+```bash
+[root@k8s-master ~]# kubectl delete ns policy-demo
+namespace "policy-demo" deleted
+[root@k8s-master ~]# kubectl create ns advanced-policy-demo
+namespace/advanced-policy-demo created
+
+
+# 使用TAML文件创建Nginx服务
+[root@k8s-master ~]# vim nginx-deployment.yaml 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: advanced-policy-demo
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+[root@k8s-master ~]# kubectl apply -f nginx-deployment.yaml 
+deployment.apps/nginx created
+[root@k8s-master ~]# kubectl expose --namespace=advanced-policy-demo deployment nginx --port=80
+service/nginx exposed
+
+
+# 验证访问权限并访问百度测试外网连通性
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+
+/ # wget -q --time=5 www.baidu.com -O -
+<!DOCTYPE html>
+<!--STATUS OK--><html> <head><meta http-equiv=content-type content=text/html;charset=utf-8><meta http-equiv=X-UA-Compatible content=IE=Edge><meta content=always name=referrer><link rel=stylesheet type=text/css href=http://s1.bdstatic.com/r/www/cache/bdorz/baidu.min.css><title>百度一下，你就知道</title></head> <body link=#0000cc> <div id=wrapper> <div id=head> <div class=head_wrapper> <div class=s_form> <div class=s_form_wrapper> <div id=lg> <img hidefocus=true src=//www.baidu.com/img/bd_logo1.png width=270 height=129> </div> <form id=form name=f action=//www.baidu.com/s class=fm> <input type=hidden name=bdorz_come value=1> <input type=hidden name=ie value=utf-8> <input type=hidden name=f value=8> <input type=hidden name=rsv_bp value=1> <input type=hidden name=rsv_idx value=1> <input type=hidden name=tn value=baidu><span class="bg s_ipt_wr"><input id=kw name=wd class=s_ipt value maxlength=255 autocomplete=off autofocus></span><span class="bg s_btn_wr"><input type=submit id=su value=百度一下 class="bg s_btn"></span> </form> </div> </div> <div id=u1> <a href=http://news.baidu.com name=tj_trnews class=mnav>新闻</a> <a href=http://www.hao123.com name=tj_trhao123 class=mnav>hao123</a> <a href=http://map.baidu.com name=tj_trmap class=mnav>地图</a> <a href=http://v.baidu.com name=tj_trvideo class=mnav>视频</a> <a href=http://tieba.baidu.com name=tj_trtieba class=mnav>贴吧</a> <noscript> <a href=http://www.baidu.com/bdorz/login.gif?login&amp;tpl=mn&amp;u=http%3A%2F%2Fwww.baidu.com%2f%3fbdorz_come%3d1 name=tj_login class=lb>登录</a> </noscript> <script>document.write('<a href="http://www.baidu.com/bdorz/login.gif?login&tpl=mn&u='+ encodeURIComponent(window.location.href+ (window.location.search === "" ? "?" : "&")+ "bdorz_come=1")+ '" name="tj_login" class="lb">登录</a>');</script> <a href=//www.baidu.com/more/ name=tj_briicon class=bri style="display: block;">更多产品</a> </div> </div> </div> <div id=ftCon> <div id=ftConw> <p id=lh> <a href=http://home.baidu.com>关于百度</a> <a href=http://ir.baidu.com>About Baidu</a> </p> <p id=cp>&copy;2017&nbsp;Baidu&nbsp;<a href=http://www.baidu.com/duty/>使用百度前必读</a>&nbsp; <a href=http://jianyi.baidu.com/ class=cp-feedback>意见反馈</a>&nbsp;京ICP证030173号&nbsp; <img src=//www.baidu.com/img/gs.gif> </p> </div> </div> </div> </body> </html>
+```
+
+### 6.2、决绝所有入口流量
+
+- 设置网络策略，要求Nginx服务拒绝所有入口流量。然后在进行访问权限的验证
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: advanced-policy-demo
+spec:
+  podSelector:
+    matchLabels: {}
+  policyTypes:
+  - Ingress
+EOF
+networkpolicy.networking.k8s.io/default-deny-ingress created
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+wget: download timed out
+/ # wget -q --timeout=5 www.baidu.com -O -
+<!DOCTYPE html>
+<!--STATUS OK--><html> <head><meta http-equiv=content-type content=text/html;charset=utf-8><meta http-equiv=X-UA-Compatible content=IE=Edge><meta content=always name=referrer><link rel=stylesheet type=text/css href=http://s1.bdstatic.com/r/www/cache/bdorz/baidu.min.css><title>百度一下，你就知道</title></head> <body link=#0000cc> <div id=wrapper> <div id=head> <div class=head_wrapper> <div class=s_form> <div class=s_form_wrapper> <div id=lg> <img hidefocus=true src=//www.baidu.com/img/bd_logo1.png width=270 height=129> </div> <form id=form name=f action=//www.baidu.com/s class=fm> <input type=hidden name=bdorz_come value=1> <input type=hidden name=ie value=utf-8> <input type=hidden name=f value=8> <input type=hidden name=rsv_bp value=1> <input type=hidden name=rsv_idx value=1> <input type=hidden name=tn value=baidu><span class="bg s_ipt_wr"><input id=kw name=wd class=s_ipt value maxlength=255 autocomplete=off autofocus></span><span class="bg s_btn_wr"><input type=submit id=su value=百度一下 class="bg s_btn"></span> </form> </div> </div> <div id=u1> <a href=http://news.baidu.com name=tj_trnews class=mnav>新闻</a> <a href=http://www.hao123.com name=tj_trhao123 class=mnav>hao123</a> <a href=http://map.baidu.com name=tj_trmap class=mnav>地图</a> <a href=http://v.baidu.com name=tj_trvideo class=mnav>视频</a> <a href=http://tieba.baidu.com name=tj_trtieba class=mnav>贴吧</a> <noscript> <a href=http://www.baidu.com/bdorz/login.gif?login&amp;tpl=mn&amp;u=http%3A%2F%2Fwww.baidu.com%2f%3fbdorz_come%3d1 name=tj_login class=lb>登录</a> </noscript> <script>document.write('<a href="http://www.baidu.com/bdorz/login.gif?login&tpl=mn&u='+ encodeURIComponent(window.location.href+ (window.location.search === "" ? "?" : "&")+ "bdorz_come=1")+ '" name="tj_login" class="lb">登录</a>');</script> <a href=//www.baidu.com/more/ name=tj_briicon class=bri style="display: block;">更多产品</a> </div> </div> </div> <div id=ftCon> <div id=ftConw> <p id=lh> <a href=http://home.baidu.com>关于百度</a> <a href=http://ir.baidu.com>About Baidu</a> </p> <p id=cp>&copy;2017&nbsp;Baidu&nbsp;<a href=http://www.baidu.com/duty/>使用百度前必读</a>&nbsp; <a href=http://jianyi.baidu.com/ class=cp-feedback>意见反馈</a>&nbsp;京ICP证030173号&nbsp; <img src=//www.baidu.com/img/gs.gif> </p> </div> </div> </div> </body> </html>
+
+# 上述命令执行结果中可以看出，对Nginx服务的入口访问被拒绝，而仍然允许对出战internet的出口访问
+```
+
+### 6.3、允许进入Nginx的流量
+
+- 执行以下命名，创建一个NetworkPolicy，设置允许流量从advanced-policy-demo命名空间中的任何Pod到Nginx Pod。创建策略成功后，就可以访问Nginx服务了
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: access-nginx
+  namespace: advanced-policy-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: nginx
+  ingress:
+    - from:
+      - podSelector:
+          matchLabels: {}
+EOF
+
+networkpolicy.networking.k8s.io/access-nginx created
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+/ # 
+```
+
+### 6.4、拒绝所有出口流量
+
+- 设置拒绝所有出口流量的网络策略，该策略设置成功后，任何策略未明确允许的入站或出战流量都将被拒绝
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: advanced-policy-demo
+spec:
+  podSelector:
+    matchLabels: {}
+  policyTypes:
+  - Egress
+EOF
+networkpolicy.networking.k8s.io/default-deny-egress created
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # nslookup nginx
+;; connection timed out; no servers could be reached
+
+/ # wget -q --timeout=5 www.baidu.com -O -
+wget: bad address 'www.baidu.com'
+```
+
+### 6.5、允许DNS出口流量
+
+- 执行以下命令，在kube-system名称空间上创建一个标签。该标签的NetworkPolicy允许DNS从advanced-policy-demo名称空间中的任何Pod到名称空间kube-system的出站流量
+
+```bash
+[root@k8s-master ~]# kubectl label namespace kube-system name=kube-system
+namespace/kube-system labeled
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-access
+  namespace: advanced-policy-demo
+spec:
+  podSelector:
+    matchLabels: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+EOF
+networkpolicy.networking.k8s.io/allow-dns-access created
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # nslookup nginx
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+** server can't find nginx.advanced-policy-demo.svc.cluster.local: NXDOMAIN
+
+*** Can't find nginx.svc.cluster.local: No answer
+*** Can't find nginx.cluster.local: No answer
+*** Can't find nginx.advanced-policy-demo.svc.cluster.local: No answer
+*** Can't find nginx.svc.cluster.local: No answer
+*** Can't find nginx.cluster.local: No answer
+
+/ # nslookup www.baidu.com
+Server:		10.96.0.10
+Address:	10.96.0.10:53
+
+Non-authoritative answer:
+www.baidu.com	canonical name = www.a.shifen.com
+Name:	www.a.shifen.com
+Address: 2408:871a:2100:2:0:ff:b09f:237
+Name:	www.a.shifen.com
+Address: 2408:871a:2100:3:0:ff:b025:348d
+
+*** Can't find www.baidu.com: No answer
+
+# 即使DNS出口流量被允许，但来自Advanced-policy-demo命名空间中的所有Pod的所有其他出口流量仍被阻止。因此，来自wget调用的HTTP出口流量仍将失败
+/ # wget -q --timeout=5 nginx -O -
+wget: download timed out
+```
+
+### 6.6、允许出口流量到Nginx
+
+- 执行以下命令，创建一个NetworkPolicy，允许从advanced-policy-demo命名空间中的任务Pod到具有app: nginx相同名称空间中标签匹配的Pod的出战流量
+
+```bash
+[root@k8s-master ~]# kubectl create -f - << EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-advance-policy-ns
+  namespace: advanced-policy-demo
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: nginx
+EOF
+networkpolicy.networking.k8s.io/allow-egress-to-advance-policy-ns created
+[root@k8s-master ~]# kubectl run --namespace=advanced-policy-demo access --rm -it --image busybox /bin/sh
+If you don't see a command prompt, try pressing enter.
+/ # wget -q --timeout=5 nginx -O -
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+/ # wget -q --timeout=5 www.baidu.com -O -
+wget: download timed out
+
+# 访问百度超时，是因为它可以解决DNS匹配标签的以外的其他任何出口访问app: nginx的advanced-policy-demo命名空间
+```
+
