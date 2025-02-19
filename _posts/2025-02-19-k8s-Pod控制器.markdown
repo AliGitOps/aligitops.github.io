@@ -1,0 +1,790 @@
+---
+layout:       post
+title:        "Kubernetes之Pod控制器"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# Pod控制器
+
+[TOC]
+
+## 一、Replication Controller（RC）
+
+### 1.1、什么是RC
+
+- Replication Controller简称RC，RC是Kubernetes系统中的核心概念之一，简单来说，RC可以保证在任意时间运行Pod的副本数量，能够保证Pod总是可用的。如果实际Pod数量比指定的多那就结束多余的Pod，如果实际数量比指定的少就启动一些Pod，当Pod失败、被删除或者挂掉后，RC都会去自动创建新的Pod来保证副本数量，所以即使只有一个Pod，我们也应该使用RC来管理我们的Pod。
+
+**幸运的是Kubernetes就为我们提供了这样的资源对象：**
+
+- Replication Controller：用来部署、升级Pod
+- Replica Set：下一代的Replication Controller
+- Deployment：可以更加方便的管理Pod和Replica Set
+
+### 1.2、RC应用
+
+- 现在来编写一个yaml文件来创建RC。
+
+```bash
+# kind：ReplicationController
+# spec.replicas：指定Pod副本数量，默认为1
+# spec.template：这里就是我们之前的Pod的定义的模块，但是不需要apiVersion和kind了
+# spec.temlate.metadata: labels注意这里的Pod的labels（标签）要和spec.selector相同，这样RC就可以来控制当前这个Pod了
+# 这个YAML文件中的意思就是定义了一个RC资源对象，它的名字叫rc-demo，保证一致会有3个Pod运行，Pod的镜像是nginx镜像
+
+
+[root@master ~]# cat nginx_rc.yaml 
+apiVersion: "v1"
+kind: ReplicationController
+metadata:
+  name: rc-demo
+  labels:
+    name: rc
+spec:
+  replicas: 3
+  selector:
+    name: rc
+  template:
+    metadata:
+     labels:
+       name: rc
+    spec:
+      containers:
+      - name: nginx-demo
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_rc.yaml 
+replicationcontroller/rc-demo created
+
+
+# 你也可以使用delete删除一个Pod，会发现会自动又多出一个新的Pod
+# 查看rc资源
+[root@master ~]# kubectl get rc
+NAME      DESIRED   CURRENT   READY   AGE
+rc-demo   3         3         3       6m28s
+# 查看pod
+[root@master ~]# kubectl get pod
+NAME            READY   STATUS    RESTARTS   AGE
+rc-demo-czr2l   1/1     Running   0          6m33s
+rc-demo-gqwlg   1/1     Running   0          6m34s
+rc-demo-lldzt   1/1     Running   0          6m33s
+```
+
+### 1.3、RC滚动更新
+
+```bash
+# rolling-update在1.11版本开始时，就已经不支持使用以下格式更新Pod数量了，而主要使用Deployment
+kubectl rolling-update rc-demo --image=nginx1.21
+```
+
+## 二、Replication Set（RS）
+
+### 2.1、什么是RS
+
+- Replication Set简称RS，随着Kubernetes的高速发展，官方已经推荐我们使用RS和Deployment来代替RC了，实际上RS和RC的功能基本一致，目前唯一的一个区别是RC只支持基于等是的selector(env=dev或deviromment!=qa)，但RS还支持基于集合的selector(version in(v1.0，12.0))，这对复杂的运维管理就非常方便了。
+- kubectl命令行工具中关于RC的大部分命令同样适用于我们的RS资源对象。不过我们也很少会去单独适用RS，它主要被Deployment这个更加高层的资源对象适用，除非用户需要自定义升级功能或根本不需要升级Pod，在一般情况下，我们推荐适用Deployment而不直接适用Replica Set
+
+**最后总结以下关于RC/RS的一些特性和作用：**
+
+- 大部分情况，我们可以通过定义一个RC实现的Pod的创建和副本数量的控制
+- RC中包含一个完整的Pod定义模块（不包含apiversion和kind）
+- RC是通过lable selector机制来实现Pod的副本的控制的
+- 通过改变RC里面的Pod的副本数量，可以实现Pod的扩缩容功能
+- 通过改变RC里面的Pod模板中镜像版本，可以实现Pod的滚动升级功能（但是不支持一键回滚，需要用相同的方法去修改镜像地址）
+
+### 2.2、RS应用
+
+```bash
+[root@master ~]# cat nginx_rs.yaml
+apiVersion: "apps/v1"
+kind: ReplicaSet
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_rs.yaml 
+replicaset.apps/nginx created
+
+
+# 查看rs
+[root@master ~]# kubectl get rs
+NAME    DESIRED   CURRENT   READY   AGE
+nginx   3         3         3       81s
+
+
+# 查看pod资源
+[root@master ~]# kubectl get pod
+NAME            READY   STATUS    RESTARTS   AGE
+nginx-9b8x2     1/1     Running   0          96s
+nginx-dlrsz     1/1     Running   0          96s
+nginx-wh7gt     1/1     Running   0          96s
+```
+
+## 三、Deployment
+
+### 3.1、什么是Deployment
+
+- Deployment同样也是Kubernetes系统的一个核心概念，主要的职责和RC、RS一样都是保证Pod的数量和健康，通过定义一个Deployment控制器会创建一个新的ReplicaSet控制器，通过ReplicaSet创建Pod，删除Deployment控制器，也会删除Deployment控制器下对应的ReplicaSet控制器和Pod资源。二者大部分功能都是完全一致的，我们可以看成是一个升级版的RC、RS控制器，那Deployment又具备那些心特性呢？
+
+**RC的全部功能：Deployment具备上面描述的RC的全部功能**
+
+- 事件和状态查看：可以查看Deployment的升级详细进度和状态
+- 回滚：当升级Pod的时候如果出现问题，可以使用回滚操作回滚到之前的任意版本
+- 版本记录：每一次对Deployment的操作，都能够保存下面，这也是保证可以回滚到任意版本的基础
+- 暂停和启动：对于每一次升级都能够随时暂停和启动
+- 对比：作为对比我们直到Deployment作为新一代的RC，不仅在功能上更为丰富了，同时我们也说过过现在官方也都是很推荐使用Deployment来管理Pod，比如一些官方组件kube-dns、kube-proxy也都是使用Deployment来管理的，所以当大家在使用的时候也最好使用Deployment来管理Pod。一般无状态服务都是使用Deployment来进行管理
+
+**什么是无状态服务**：
+
+- 服务不依赖自身的状态，示例的状态数据可以维护在内存中
+- 任何一个请求都可以被任意的一个实例处理
+- 不存储状态数据，实例可以水平拓展，通过负载均衡将请求分发到各个节点
+- 通常存在于单体架构的集群中
+
+### 3.2、更新节奏和更新逻辑
+
+- 比如说Deployment控制5个Pod副本，Pod的期望值是5个，但是升级的时候需要额外多几个Pod，那我们控制器可以控制在5个Pod副本之外还能再增加几个Pod副本；比方说能多一个，但是不能少，那么升级的收就是先增加一个，再删除一个，增加一个删除一个，始终保持Pod副本数是5个；还有一种情况，最多允许多一个，最少允许少一个，也就是最好6个，最少4个，第一次加一个，删除两个，第二次加两个，删除两个依次类推，可以自己控制更新的方式，这种滚动更新需要加readinessProbe和livenessProbe探测确保Pod中容器里的应用都正常启动了才能删除之前的Pod。
+- 启动第一步，刚更新第一批就暂停了也可以；假设目标是5个，允许一个也不能少，允许最多可以10个，那么加5个即可；这就是我们可以自己控制节奏来控制更新的方法。
+
+**通过Deployment对象，你可以轻松的做到以下事情：**
+
+- 1、创建ReplicaSet和Pod
+- 2、滚动升级（不停止旧服务的状态下升级）和回滚应用（将应用回滚到之前的版本）
+- 3、平滑地扩容和缩容
+- 4、暂停和继续Deployment
+
+### 3.3、自定义滚动更新策略
+
+![image-20240626083844399](W:\images\image-20240626083844399.png)
+
+**maxSurge和maxUnavailable用来控制滚动更新的更新策略**
+
+- maxUnavailable：和期望ready的副本数比，不可用副本数量最大比例（或最大值），这个值越小，越能保证服务我稳定，更新越平滑
+- maxSurge：和期望ready的副本数比，越过期望副本数最大比例（或最大值），这个值调用越大，副本更细速度越快
+
+**比例**
+
+- maxUnavailable：[0%,100%]向下取整，比如10个副本，5%的话==0.5个，但计算按照0个
+- maxSurge：[0%,100%]向上取整，比如10个副本，5%的话==0.5个，但计算按照1个；
+
+**注意：两则不能同时为0**
+
+建议配置:
+
+- maxUnavilable == 0
+- maxSurge == 1
+
+### 3.4、Deployment应用
+
+```bash
+[root@master ~]# cat nginx_deployment.yaml 
+apiVersion: "apps/v1"
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: nginx
+  # 用于将现有Pod替换为新Pod的部署策略
+  strategy:
+    rollingUpdate:
+    # maxSurge: 1 意味着在滚动更新期间，可以同时比期望的副本数多运行一个 Pod。例如，如果 .spec.replicas 是 6，那么在最坏的情况下，可能会有 7 个 Pod 同时运行（6 个旧的 + 1 个新的）。
+      maxSurge: 1
+    # maxUnavailable: 0 意味着在滚动更新期间，不会有任何旧 Pod 处于不可用状态。换句话说，在删除一个旧 Pod 之前，必须确保一个新的 Pod 已经就绪。这可以确保在更新过程中始终有至少 .spec.replicas 数量的 Pod 可用。
+      maxUnavailable: 0
+  template:
+    metadata:
+      name: nginx
+      labels: 
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+        imagePullPolicy: IfNotPresent
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_deployment.yaml 
+deployment.apps/nginx created
+
+
+# 查看deployment
+[root@master ~]# kubectl get deployment
+NAME    READY   UP-TO-DATE   AVAILABLE   AGE
+nginx   6/6     6            6           56s
+
+
+# 查看Pod
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-795ff9d4cc-5zd79   1/1     Running   0          89s
+nginx-795ff9d4cc-6wgjs   1/1     Running   0          89s
+nginx-795ff9d4cc-9pfxs   1/1     Running   0          89s
+nginx-795ff9d4cc-gbzvr   1/1     Running   0          86s
+nginx-795ff9d4cc-hcztd   1/1     Running   0          89s
+nginx-795ff9d4cc-jxz28   1/1     Running   0          88s
+```
+
+### 3.5、扩缩容Pod应用
+
+```bash
+# 修改yaml文件中的replics配置，然后重新应用yaml文件
+# replicas的值修改的比之前多就是扩容，比之前少就是缩容
+[root@master ~]# cat nginx_deployment.yaml | grep 8
+  replicas: 8
+
+
+# 重新部署
+[root@master ~]# kubectl apply -f nginx_deployment.yaml 
+deployment.apps/nginx configured
+
+
+# 还可以使用edit直接修改
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-795ff9d4cc-5zd79   1/1     Running   0          8m
+nginx-795ff9d4cc-6wgjs   1/1     Running   0          8m
+nginx-795ff9d4cc-9pfxs   1/1     Running   0          8m
+nginx-795ff9d4cc-d4q2f   1/1     Running   0          38s
+nginx-795ff9d4cc-gbzvr   1/1     Running   0          7m57s
+nginx-795ff9d4cc-gxnhw   1/1     Running   0          38s
+nginx-795ff9d4cc-hcztd   1/1     Running   0          8m
+nginx-795ff9d4cc-jxz28   1/1     Running   0          7m59s
+# 找到replicas配置修改完以后保存即可，配置文件将理解生效（谨慎）
+[root@master ~]# kubectl edit deployment nginx
+deployment.apps/nginx edited
+
+
+# 查看deployment资源，我刚刚修改为了9个Pod副本数量
+[root@master ~]# kubectl get deployment
+NAME    READY   UP-TO-DATE   AVAILABLE   AGE
+nginx   9/9     9            9           9m46s
+
+
+# 还可以使用命令行的方式指定数量即可，使用--replicas指定数量即可
+[root@master ~]# kubectl scale deployment nginx --replicas=2
+deployment.apps/nginx scaled
+[root@master ~]# kubectl get deployment
+NAME    READY   UP-TO-DATE   AVAILABLE   AGE
+nginx   2/2     2            2           11m
+```
+
+### 3.6、滚动更新应用
+
+#### 3.6.1、更新
+
+```bash
+# 编写yaml文件中image，然后重新应用yaml文件
+[root@master ~]# vi nginx_deployment.yaml 
+	image: nginx:1.21
+	
+# 重新部署资源
+[root@master ~]# kubectl apply -f nginx_deployment.yaml 
+deployment.apps/nginx configured
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS              RESTARTS   AGE
+nginx-5ff79c7ff8-2fn4r   0/1     ContainerCreating   0          27s
+nginx-795ff9d4cc-55h7p   1/1     Running             0          27s
+nginx-795ff9d4cc-8fpqg   1/1     Running             0          27s
+nginx-795ff9d4cc-9pfxs   1/1     Running             0          14m
+nginx-795ff9d4cc-bmpnn   1/1     Running             0          27s
+nginx-795ff9d4cc-hcztd   1/1     Running             0          14m
+nginx-795ff9d4cc-rtffd   1/1     Running             0          27s
+nginx-795ff9d4cc-wxvl2   1/1     Running             0          27s
+nginx-795ff9d4cc-xcfbn   1/1     Running             0          27s
+
+
+# 使用以下命令可以查看发布历史
+[root@master ~]# kubectl rollout history deployment nginx
+deployment.apps/nginx 
+REVISION  CHANGE-CAUSE
+0         <none>
+1         <none>
+2         <none>
+
+
+# 使用--revision可以查看某个发布历史的具体信息
+[root@master ~]# kubectl rollout history deployment nginx --revision=1
+deployment.apps/nginx with revision #1
+Pod Template:
+  Labels:	app=nginx
+	pod-template-hash=795ff9d4cc
+  Containers:
+   nginx:
+    Image:	nginx:1.20
+    Port:	<none>
+    Host Port:	<none>
+    Environment:	<none>
+    Mounts:	<none>
+  Volumes:	<none>
+[root@master ~]# kubectl rollout history deployment nginx --revision=2
+deployment.apps/nginx with revision #2
+Pod Template:
+  Labels:	app=nginx
+	pod-template-hash=5ff79c7ff8
+  Containers:
+   nginx:
+    Image:	nginx:1.21
+    Port:	<none>
+    Host Port:	<none>
+    Environment:	<none>
+    Mounts:	<none>
+  Volumes:	<none>
+
+
+# 还可以使用kubectl set image命令来进行滚动更新
+[root@master ~]# kubectl get deployment
+NAME    READY   UP-TO-DATE   AVAILABLE   AGE
+nginx   8/8     8            8           16m
+[root@master ~]# kubectl set image deployment nginx nginx=nginx:1.22
+deployment.apps/nginx image updated
+[root@master ~]# kubectl get pod 
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-7c8489bfcf-4jbc2   1/1     Running   0          13s
+nginx-7c8489bfcf-8f575   1/1     Running   0          18s
+nginx-7c8489bfcf-8pcp9   1/1     Running   0          14s
+nginx-7c8489bfcf-cs2jh   1/1     Running   0          16s
+nginx-7c8489bfcf-g8zmh   1/1     Running   0          12s
+nginx-7c8489bfcf-t8c4l   1/1     Running   0          11s
+nginx-7c8489bfcf-t8q47   1/1     Running   0          15s
+
+# 查看发布状态
+[root@master ~]# kubectl rollout status deployment nginx
+deployment "nginx" successfully rolled out
+
+
+# 验证是否更新nginx镜像版本
+[root@master ~]# kubectl exec -it nginx-7c8489bfcf-wdtgh -- nginx -v
+nginx version: nginx/1.22.1
+```
+
+#### 3.6.2、回滚
+
+```bash
+# 查看上线历史
+[root@master ~]# kubectl rollout history deployment nginx
+deployment.apps/nginx 
+REVISION  CHANGE-CAUSE
+0         <none>
+1         <none>
+2         <none>
+3         <none>
+
+
+# 回滚到上一个版本（nginx:1.21）
+[root@master ~]# kubectl rollout undo deployment nginx
+deployment.apps/nginx rolled back
+# 随便找一个deployment的Pod进行验证即可
+[root@master ~]# kubectl exec -it nginx-5ff79c7ff8-pvg74 -- nginx -v
+nginx version: nginx/1.21.5
+
+
+# 回滚到指定版本
+[root@master ~]# kubectl rollout undo deployment nginx --to-revision=1
+deployment.apps/nginx rolled back
+# 随便找一个deployment的Pod进行验证即可
+[root@master ~]# kubectl exec -it nginx-795ff9d4cc-plm4l -- nginx -v
+nginx version: nginx/1.20.2
+
+
+# 查看回滚状态
+[root@master ~]# kubectl rollout status deployment nginx
+deployment "nginx" successfully rolled out
+```
+
+#### 3.7、其他操作
+
+```bash
+# 暂停deployment更新
+[root@master ~]# kubectl rollout pause deployment nginx
+deployment.apps/nginx paused
+
+
+# 恢复deployment更新
+[root@master ~]# kubectl rollout resume deployment nginx
+deployment.apps/nginx resumed
+```
+
+## 四、DaemonSet
+
+### 4.1、什么是DaemonSet
+
+- 通过该控制器的名称我们可以看出它的用法：Daemon，就是用来部署守护进程的，DaemonSet用于再每个Kubernetes节点中将守护进程的副本作为后台进程运行，说白了就是在每个节点部署一个Pod副本，当节点加入到Kubernetes集群中，Pod会被调度到该节点上运行，当节点从集群只能够能移除后，该节点上的这个Pod也会被移除，当然，如果我们删除DaemonSet，所有和这个对象相关的Pods都会被删除
+
+**这哪种情况下我们会需要用到这种业务场景呢？其实这种场景还是比较普通的，比如：**
+
+- 集群存储守护程序：如glusterd、ceph要部署在每个节点上提供持久化存储
+
+- 节点监视守护进程：如Prometheus监控集群，可以在每个节点上运行一个node-exporter进程来收集监控节点的信息
+- 日志收集守护程序：如fluentd或logstash，在每个节点上运行以收集容器的日志
+
+### 4.2、DaemonSet应用
+
+```bash
+[root@master ~]# cat nginx-ds.yaml 
+apiVersion: "apps/v1"
+kind: DaemonSet
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      name: nginx
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.20
+        imagePullPolicy: IfNotPresent
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx-ds.yaml 
+daemonset.apps/nginx created
+
+
+# 查看ds
+[root@master ~]# kubectl get ds
+NAME    DESIRED   CURRENT   READY   UP-TO-DATE   AVAILABLE   NODE SELECTOR   AGE
+nginx   2         2         2       2            2           <none>          35s
+
+
+# 可以查到node节点上都运行了一个nginx的Pod
+[root@master ~]# kubectl get pod -o wide
+NAME                     READY   STATUS    RESTARTS   AGE    IP            NODE    NOMINATED NODE   READINESS GATES
+nginx-vplg4              1/1     Running   0          72s    10.244.1.30   node2   <none>           <none>
+nginx-wd7pq              1/1     Running   0          72s    10.244.2.27   node1   <none>           <none>
+
+
+# 仔细观察会发信啊master节点并没有运行Pod，因为这涉及到污点
+[root@master ~]# kubectl get node
+NAME     STATUS   ROLES                  AGE   VERSION
+master   Ready    control-plane,master   42h   v1.23.0
+node1    Ready    <none>                 42h   v1.23.0
+node2    Ready    <none>                 42h   v1.23.0
+```
+
+## 五、StatefulSet
+
+- 在学习StatefulSet这种控制器之前，要先弄明白一个概念：**什么叫无状态服务？**
+
+### 5.1、有状态服务
+
+- 有状态服务（Stateful Service）：该服务运行的实例需要在本地存储持久化服务，比如上面的MySQL数据库，你现在运行在节点A，那么它的数据就存储在节点A上面的，如果这个时候你把该服务迁移到节点B去的话，那么就没有之前的数据了，因为它需要去对应的数据目录里面恢复数据，而此没有任何数据。
+
+**有状态服务的特点：**
+
+- 服务本身依赖或者存在局部的状态数据，这些数据需要自身持久化或者可以通过其他节点恢复
+- 一个请求只能被某个节点（或者同等状态的节点）处理
+- 存储状态数据，实力的拓展需要整个系统参与状态的迁移
+- 在一个封闭的系统中，存在多个数据闭环，需要考虑这些闭环的数据一致性问题
+- 通常存在于分布式架构中
+
+### 5.2、什么是StatefulSet
+
+- StatefulSet是用来管理有状态应用的工作负载API对象。和Deployment类似，StatefulSet管理基于相同容器规约的一组Pod。但是Deployment不同的是，StatefulSet为他们的每个Pod维护了一个粘性的ID。这些Pod是雨季相同的规约来创建的，但是不能相互替换：无论怎么调度，每个Pod都有永久不变的ID。
+- StatefulSet类似ReplicaSet，但是它可以处理Pod的启动顺序，为保留每个Pod的状态设置唯一表示，**同时具有以下功能：**
+
+稳定的、唯一的网络标识符
+
+稳定的、持久化的存储
+
+稳定的、优雅的部署和缩放
+
+有序的、优化的部署的缩放
+
+有序的、优化的删除和终止
+
+有序的、自动滚动更新
+
+### 5.3、无头服务（Headless service）
+
+- Headless service不分配clusterIP，headless service可以通过解析service的DNS返回所有的Pod的dns和ip地址（statefulSet部署的Pod才有DNS），普通的service只能通过解析service的DNS返回service的ClusterIP
+
+  **为什么要用headless service（没有service ip的service）？**
+
+- 在使用Deployment时，创建的Pod名称是没有顺序的，是随机字符串，在用statefulset管理Pod时要求pod名称必须是有序的，每一个Pod不能被随意取代，Pod重建后pod名称还是一样的。因为pod IP是变化的，所以要用Pod名称来识别。Pod名称是pod唯一性的标识符，必须持久稳定有效。这时要用到无头服务，他可以给每个Pod一个唯一的名称
+
+headless service会为servie分配一个域名，域名格式如下：
+
+```bash
+<service name>.$<namespace name>.svc.cluster.local
+```
+
+k8s中资源的全局FQDN格式
+
+```bash
+Service_NAME.NameSpace_NAME.Domain.LTD.
+Domain.LTD.=svc.cluster.local.　　　　 #这是默认k8s集群的域名。
+```
+
+StatefulSet会为关联的Pod分配一个dnsName
+
+```bash
+$<Pod Name>.$<service name>.$<namespace name>.svc.cluster.local
+```
+
+### 5.4、StatefulSet应用
+
+```bash
+[root@master ~]# cat nginx_sts.yaml 
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: nginx
+spec:
+  clusterIP: None
+  ports:
+  - port: 80
+    targetPort: 80
+  selector:
+    app: nginx
+---
+apiVersion: "apps/v1"
+kind: StatefulSet
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  serviceName: nginx
+  template:
+    metadata:
+      name: nginx
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_sts.yaml 
+service/nginx created
+statefulset.apps/nginx unchanged
+
+
+# 查看sts
+[root@master ~]# kubectl get sts
+NAME    READY   AGE
+nginx   2/2     45s
+
+
+# 查看pod
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-0                  1/1     Running   0          63s
+nginx-1                  1/1     Running   0          46s
+```
+
+### 5.5、扩容缩容
+
+```bash
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-0                  1/1     Running   0          2m6s
+nginx-1                  1/1     Running   0          109s
+nginx-2                  1/1     Running   0          10s
+nginx-3                  1/1     Running   0          9s# --replicas选项可以调整副本数量
+[root@master ~]# kubectl scale sts nginx --replicas=4
+statefulset.apps/nginx scaled
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS    RESTARTS   AGE
+nginx-0                  1/1     Running   0          2m6s
+nginx-1                  1/1     Running   0          109s
+nginx-2                  1/1     Running   0          10s
+nginx-3                  1/1     Running   0          9s
+```
+
+### 5.6、删除
+
+- 删除StatefulSet有两种方式：级联删除和非级联删除
+- 使用非级联方式删除StatefulSet时，StatefulSet的Pod不会被删除。使用级联方式删除StatefulSet时，StatefulSet和它的Pod都会被删除
+
+#### 5.6.1、级联删除
+
+```bash
+[root@master ~]# kubectl delete sts nginx
+statefulset.apps "nginx" deleted
+```
+
+#### 5.6.2、非级联删除
+
+```bash
+# 重新加载资源用于验证
+[root@master ~]# kubectl apply -f nginx_sts.yaml 
+service/nginx unchanged
+statefulset.apps/nginx created
+
+
+[root@master ~]# kubectl delete sts nginx --cascade=false
+warning: --cascade=false is deprecated (boolean value) and can be replaced with --cascade=orphan.
+statefulset.apps "nginx" deleted
+[root@master ~]# kubectl get sts
+No resources found in default namespace.
+[root@master ~]# kubectl get pod
+NAME      READY   STATUS    RESTARTS   AGE
+nginx-0   1/1     Running   0          38s
+nginx-1   1/1     Running   0          36s
+```
+
+## 六、任务
+
+- 我们在日常的工作中经常会遇到一些需要进行批量数据处理的分析的需求，当然也会有按时间来进行调度的工作，在我们Kubernetes集群中为我们提供了Job和CronJob两种资源对象来应对我们这种需求
+- Job负载处理任务，即仅执行一次的任务，它保证批处理人物的一个或多个Pod成功结束，而CronJob则就是在Job上加了时间调度
+
+### 6.1、一次性任务（Job）
+
+- 我们用Job这个资源对象来创建一个任务，我们顶一个Job来执行一个倒计时的任务，定义Yaml文件
+
+```bash
+# 注意Job的RestartPolicy仅支持Never和OnFailure两种，不支持Always，我们直到Job就相当于来执行一个批处理任务，执行完就结束了，如果支持Always的话就会陷入死循环
+[root@master ~]# cat job-demo.yaml 
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-demo
+spec:
+  template:
+    metadata:
+      name: job-demo
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: cunter
+        image: busybox
+        command:
+        - "bin/sh"
+        - "-c"
+        - "for i in 9 8 7 6 5 4 3 2 1; do echo $i;sleep 1; done"
+        
+        
+# 部署资源
+[root@master ~]# kubectl apply -f job-demo.yaml 
+job.batch/job-demo created
+
+
+# 查看job
+[root@master ~]# kubectl get job
+NAME       COMPLETIONS   DURATION   AGE
+job-demo   1/1           27s        46s
+
+
+# job运行完以后，pod的状态是Completed
+[root@master ~]# kubectl get pod
+NAME                     READY   STATUS      RESTARTS   AGE
+job-demo-qhr9p           0/1     Completed   0          104s
+
+
+# 使用kubectl logs可以查看日志
+[root@master ~]# kubectl logs job-demo-qhr9p
+9
+8
+7
+6
+5
+4
+3
+2
+1
+```
+
+### 6.2、周期性任务（Cronjob）
+
+- CronJob其实就是在Job的基础上加上了时间调度，我们可以：在给定的时间点运行一个任务，也可以周期性地在给定时间点运行任务。这个实际上和我们Linux长得crontab就非常累死了
+- 一个CronJob对象其实就是对应用中的crontab文件中的一行，它根据配置的时间格式周期性地运行一个job，格式和crontab一样的
+
+```bash
+分 时 日 月 星期 要运行的命令 
+第1列分钟0～59 
+第2列小时0～23 
+第3列日1～31 
+第4列月1～12 
+第5列星期0～7（0和7表示星期天） 
+第6列要运行的命令
+```
+
+- 现在，我们用CronJob来管理我们上面的Job任务
+
+```bash
+[root@master ~]# cat cronjob-demo.yaml 
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cronjob-demo
+spec:
+  # 每隔一分钟执行一个这个pod中的任务
+  schedule: "*/1 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: hello
+            image: busybox
+            args:
+            - "bin/sh"
+            - "-c"
+            - "for i in 9 8 7 6 5 4 3 2 1; do echo $i;sleep 1; done"
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f cronjob-demo.yaml 
+cronjob.batch/cronjob-demo created
+
+
+# 查看cronjob
+[root@master ~]# kubectl get cronjob
+NAME           SCHEDULE    SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+cronjob-demo   * * * * *   False     1        9s              38s
+
+
+# 查看pod
+[root@master ~]# kubectl get pod
+NAME                          READY   STATUS      RESTARTS   AGE
+cronjob-demo-28656169-wdcvh   1/1     Running     0          22s
+```
+
