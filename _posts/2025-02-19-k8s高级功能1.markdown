@@ -1,0 +1,1513 @@
+---
+layout:       post
+title:        "Kubernetes高级功能1"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# Kubernetes高级功能
+
+[TOC]
+
+## 资源列表
+
+| 操作系统   | 配置 | 主机名     | IP             | 所需软件                                                     |
+| ---------- | ---- | ---------- | -------------- | ------------------------------------------------------------ |
+| CentOS 7.9 | 2C4G | k8s-master | 192.168.93.101 | Docker Ce、kube-apiserver、kube-controller-manager、kube-scheduler、kubelet、Etcd、kube-proxy |
+| CentOS 7.9 | 2C4G | k8s-node01 | 192.168.93.102 | Docker CE、kubectl、kube-proxy、Flnnel                       |
+| CentOS 7.9 | 2C4G | k8s-node02 | 192.168.93.103 | Docker CE、kubectl、kube-proxy、Flnnel                       |
+
+## 基础环境
+
+- 关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+- 关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/^SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+- 修改主机名
+
+```bash
+hostnamectl set-hostname k8s-master
+hostnamectl set-hostname k8s-node01
+hostnamectl set-hostname k8s-node02
+```
+
+## 一、ConfigMap
+
+### 1.1、什么是ConfigMap
+
+- Configmap是k8s中的资源对象，用于保存非机密性的配置的，数据可以用key/value键值对的形式保存，也可通过文件的形式保存
+
+### 1.2、ConfigMap能解决哪些问题
+
+- 我们在部署服务的时候，每个服务都有自己的配置文件，如果一台服务器上部署多个服务：nginx、tomcat、apache等，那么这些配置都存在这个节点上，假如一台服务器不能满足线上高并发的要求，需要对服务器扩容，扩容之后的服务器还是需要部署多个服务 ：nginx、tomcat、apache，新增加的服务器上还是要管理这些服务的配置，如果一个服务出现问题，需要修改配置文件，每台物理节点上还是要配置要修改，这种方式肯定满足不了线上大批量的配置变更要求。所以k8s中加入了ConfigMap资源对象，可以当成volume挂载到pod中，实现统一的配置管理
+
+- ConfigMap是k8s中的资源，相当于配置文件，可以有一个或者多个ConfigMap
+- ConfigMap可以做成volume，k8s pod启动之后，通过volume形式映射到容器内部指定目录上
+- 容器中应用程序按照原有方式读取容器特定目录上的配置文件
+- 在容器看来，配置文件就像是打包在容器内部特定目录，整个过程对应用没有任何侵入
+
+### 1.3、ConfigMap应用场景
+
+- 使用k8s部署应用，当你讲应用配置写入代码中，更新配置时也需要打包镜像，configmap可以讲配置信息和docker镜像解耦，以便实现镜像的可移植性和可复用性，因为一个configmap其实就是一系列配置信息的集合，可直接注入到Pod中给容器使用。configmap注入方式有两种，一种将configMap作为存储卷，一种是将configMap通过env中configMapKeRef注入到容器中
+
+- 使用微服务架构的话，存在多个服务公用配置的情况，如果每个服务中单独一份配置的话，那么更新配置就很麻烦，使用configmap可以友好的进行配置共享。
+
+### 1.4、ConfigMap局限性
+
+- ConfigMap在设计上不是用来保存大数量数据的。在ConfigMap中保存的数据不可超越1M。如果你需要保存超出尺寸限制的数据，可以考虑挂载存储卷或者使用独立的数据库或者文件服务
+
+### 1.5、ConfigMap的创建方法
+
+#### 1.5.1、命令行直接创建
+
+```bash
+# 创建一个叫tomcat-config的configmap
+# 通过--from-literal 指定参数
+[root@master ~]# kubectl create configmap tomcat-config --from-literal=tomcat_port=8080 --from-literal=server_name=myapp.tomcato.com
+configmap/tomcat-config created
+
+
+[root@master ~]# kubectl describe configmap tomcat-config
+Name:         tomcat-config
+Namespace:    default
+Labels:       <none>
+Annotations:  <none>
+
+Data
+====
+server_name:
+----
+myapp.tomcato.com
+tomcat_port:
+----
+8080
+
+BinaryData
+====
+
+Events:  <none>
+```
+
+#### 1.5.2、通过文件创建
+
+```bash
+# 准备配置文件
+[root@master ~]# cat > nginx.conf << EOF
+server {
+    server_name www.nginx.com;
+    listen 80;
+    root /usr/share/nginx/html;
+}
+EOF
+
+
+# 创建一个叫www-nginx的configmap
+# --from-file 指定从文件中读取，设置www变量的内容为nginx.conf里面的容器
+[root@master ~]# kubectl create configmap www-nginx --from-file=www=nginx.conf
+configmap/www-nginx created
+[root@master ~]# kubectl describe configmap www-nginx
+Name:         www-nginx
+Namespace:    default
+Labels:       <none>
+Annotations:  <none>
+
+Data
+====
+www:
+----
+server {
+    server_name www.nginx.com;
+    listen 80;
+    root /usr/share/nginx/html;
+}
+
+
+BinaryData
+====
+
+Events:  <none>
+```
+
+#### 1.5.3、指定目录创建
+
+```bash
+# 准备一个目录，以及目录里面的配置文件
+[root@master ~]# mkdir test-a
+[root@master ~]# cat > test-a/my-server.cnf << EOF
+server-id=1
+EOF
+[root@master ~]# cat > test-a/my-slave.cnf << EOF
+server-id=2
+EOF
+
+
+# 创建一个叫mysql-config的configmap
+# --from-file 从指定的目录里面加载配置文件
+[root@master ~]# kubectl create configmap mysql-config --from-file=test-a 
+configmap/mysql-config created
+[root@master ~]# kubectl describe configmap mysql-config
+Name:         mysql-config
+Namespace:    default
+Labels:       <none>
+Annotations:  <none>
+
+Data
+====
+my-server.cnf:
+----
+server-id=1
+
+my-slave.cnf:
+----
+server-id=2
+
+
+BinaryData
+====
+
+Events:  <none>
+```
+
+#### 1.5.4、编写yaml文件创建
+
+```bash
+# 定义一个叫mysql的configmap
+[root@master ~]# cat mysql_configmap.yaml 
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+data:
+  # master.cnf为变量名|下面是值
+  master.cnf: |
+    [mysqld]
+    server-id=1
+    log-bin
+    log_bin_trust_function_creators=1
+  # slave.cnf为变量名|下面是值
+  slave.cnf: |
+     [mysqld]
+    server-id=2
+    log-bin
+    log_bin_trust_function_creators=1
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f mysql_configmap.yaml 
+configmap/mysql created
+
+
+# 查看mysql这个configmap的内容
+[root@master ~]# kubectl describe configmap mysql
+Name:         mysql
+Namespace:    default
+Labels:       app=mysql
+Annotations:  <none>
+
+Data
+====
+master.cnf:
+----
+[mysqld]
+server-id=1
+log-bin
+log_bin_trust_function_creators=1
+
+slave.cnf:
+----
+[mysqld]
+server-id=2
+log-bin
+log_bin_trust_function_creators=1
+
+
+BinaryData
+====
+
+Events:  <none>
+```
+
+### 1.6、ConfigMap应用
+
+#### 1.6.1、通过环境变量引入
+
+##### 1.6.1.1、使用configMapKeyRef
+
+- 该yaml文件创建一个叫mysql的configmap，同时也创建了一个Pod来使用configmap。这里面使用env环境变量的方式进行引入，name指定key，valueFrom表示数据的来源，这里面使用configMapKeyRef这种方式，该配置需要指定name以及Key两个参数，name就写configmap的名字，key就写configmap里面的key
+
+```bash
+[root@master ~]# cat configmap_cmker.yaml 
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+data:
+  master.cnf: |
+    [mysqld]
+    server-id=1
+    log-bin
+    log_bin_trust_function_creators=1
+  slave.cnf: |
+    [mysqld]
+    server-id=2
+    log-bin
+    log_bin_trust_function_creators=1
+---
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: mysql-pod
+spec:
+  containers:
+  - name: mysql
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: [ "/bin/sh", "-c", "sleep 3600" ]
+    env:
+    # 容器中的新变量名字
+    - name: mysql_master
+      valueFrom:
+        configMapKeyRef:
+        # 指定为configmap的名字
+          name: mysql
+          # 引入configmap中的master.cnf变量里面的值
+          key: "master.cnf"
+    - name: mysql_slave
+      valueFrom:
+        configMapKeyRef:
+          name: mysql
+          key: "slave.cnf"
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f configmap_cmker.yaml 
+configmap/mysql created
+pod/mysql-pod created
+
+
+# 登录到Pod里面使用echo把变量打印出来
+[root@master ~]# kubectl exec -it mysql-pod -- sh
+/ # echo "$mysql_master"
+[mysqld]
+server-id=1
+log-bin
+log_bin_trust_function_creators=1
+
+/ # echo "$mysql_slave"
+[mysqld]
+server-id=2
+log-bin
+log_bin_trust_function_creators=1
+
+
+# 也可以通过env查看变量
+/ # env
+KUBERNETES_SERVICE_PORT=443
+KUBERNETES_PORT=tcp://10.1.0.1:443
+HOSTNAME=mysql-pod
+SHLVL=1
+HOME=/root
+mysql_master=[mysqld]
+server-id=1
+log-bin
+log_bin_trust_function_creators=1
+
+TERM=xterm
+mysql_slave=[mysqld]
+server-id=2
+log-bin
+log_bin_trust_function_creators=1
+
+KUBERNETES_PORT_443_TCP_ADDR=10.1.0.1
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+KUBERNETES_PORT_443_TCP_PORT=443
+KUBERNETES_PORT_443_TCP_PROTO=tcp
+KUBERNETES_SERVICE_PORT_HTTPS=443
+KUBERNETES_PORT_443_TCP=tcp://10.1.0.1:443
+KUBERNETES_SERVICE_HOST=10.1.0.1
+PWD=/
+```
+
+##### 1.6.1.2、使用envfrom
+
+- 该yaml文件创建一个叫mysql的configmap，同时也创建了一个Pod来使用configmap
+
+```bash
+[root@master ~]# cat configmap_ef.yaml 
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+data:
+  master_cnf: |
+    [mysqld]
+    server-id=1
+    log-bin
+    log_bin_trust_function_creators=1
+  slave_cnf: |
+    [mysqld]
+    server-id=2
+    log-bin
+    log_bin_trust_function_creators=1
+---
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: mysql-pod
+spec:
+  containers:
+  - name: mysql
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: [ "/bin/sh", "-c", "sleep 3600" ]
+    envFrom:
+    - configMapRef:
+        name: mysql  # 指定configmap的名字
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f configmap_ef.yaml 
+configmap/mysql created
+pod/mysql-pod created
+
+
+# 查看pod里面configmap已经生效
+[root@master ~]# kubectl exec -it mysql-pod -- sh
+/ # echo $master_cnf
+[mysqld] server-id=1 log-bin log_bin_trust_function_creators=1
+/ # echo $slave_cnf
+[mysqld] server-id=2 log-bin log_bin_trust_function_creators=1
+```
+
+#### 1.6.2、通过Volume挂载使用
+
+- 可以把ConfigMap做成Volume挂载到Pod里面，该yaml文件创建了一个叫mysql的ConfigMap以及一个Pod。该Pod使用volumes挂载ConfigMap
+
+```bash
+[root@master ~]# cat configmap_v.yaml 
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  name: mysql
+  labels:
+    app: mysql
+data:
+  master.cnf: |
+    [mysqld]
+    server-id=1
+    log-bin
+    log_bin_trust_function_creators=1
+  slave.cnf: |
+    [mysqld]
+    server-id=2
+    log-bin
+    log_bin_trust_function_creators=1
+---
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: mysql-pod
+spec:
+  containers:
+  - name: mysql
+    image: busybox
+    imagePullPolicy: IfNotPresent
+    command: [ "/bin/sh", "-c", "sleep 3600" ]
+    # 挂载configmap
+    volumeMounts:
+      # 将名字为mysql-config的卷挂载到Pod中的/opt目录下
+    - name: mysql-config
+      mountPath: /opt
+# 定义一个卷
+  volumes:
+# 卷的名字叫mysql-config
+  - name: mysql-config
+# 将名字为mysql的configmap的数据挂载到这个卷中
+    configMap:
+      name: mysql
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f configmap_v.yaml 
+configmap/mysql created
+pod/mysql-pod created
+
+
+# 查看数据
+[root@master ~]# kubectl exec -it mysql-pod -- ls /opt
+master.cnf  slave.cnf
+[root@master ~]# kubectl exec -it mysql-pod -- cat /opt/master.cnf
+[mysqld]
+server-id=1
+log-bin
+log_bin_trust_function_creators=1
+[root@master ~]# kubectl exec -it mysql-pod -- cat /opt/slave.cnf
+[mysqld]
+server-id=2
+log-bin
+log_bin_trust_function_creators=1
+```
+
+### 1.7、ConfigMap热更新
+
+- ConfigMap的热更新对于动态配置和应用程序的灵活性非常重要，具体作用如下：
+
+**动态配置更新：**通过使用ConfigMap，你可以将应用程序的配置与应用程序本身分离。当配置更改时，可以直接更新ConfigMap而不需要重新构建或启动应用程序。这允许你实现动态配置更新，即在不停止服务的情况下应用新的配置
+
+**无须重新部署：**通过热更新configMap，你可以避免重新部署整个应用程序。这对于在生产环境中保持高可用性和最小化服务中断非常有用。应用程序可以检测到ConfigMap的更新并相应的做出整改行为
+
+**灵活性和快速相应：**通过将配置信息存储在ConfigMap中并实现热更新，你可以更灵活地调整应用程序的行为，而无需等待完整的重新部署周期，这有助于快速相应变化和调整应用程序的配置
+
+**集中管理配置：**ConfigMap允许你集中管理应用程序的配置信息，而不必将其硬编码到应用程序代码中。这使得配置更易于维护和管理，同时提供了一个单一的入口点来修改配置
+
+
+
+- 使用该ConfigMap挂载的Env不会同步更新
+- 使用该ConfigMap挂载的Volume中的数据需要一段时间（实测大概10秒左右）才能同步更新
+
+```bash
+[root@master ~]# kubectl exec -it mysql-pod -- cat /opt/master.cnf
+[mysqld]
+server-id=1
+log-bin
+log_bin_trust_function_creators=1
+
+
+# 使用edit修改mysql这个ConfigMap的内容
+[root@master ~]# kubectl edit cm mysql
+  server-id=10
+  # 保存退出后的回显
+configmap/mysql edited
+
+# 大约10秒左右配置就应用上了
+[root@master ~]# kubectl exec -it mysql-pod -- cat /opt/master.cnf
+[mysqld]
+server-id=10
+log-bin
+log_bin_trust_function_creators=1
+```
+
+## 二、Secret
+
+- ConfigMap这个资源对象是Kubernetes当中非常重要的一个资源对象，一般情况下ConfigMap是用来存储一些非安全的配置信息，乳沟涉及到一些安全相关的数据的话用ConfigMap就非常不稳妥了，因为ConfigMap是名为存储的，我们说这个时候我们就需要用到另一个资源对象了：Secret，Secret用来保存敏感信息，例如密码、OAuth令牌和ssh  key等等，将这些信息放在Secret中比放在Pod的定义中或者Docker镜像中来说更加安全和灵活
+
+### 2.1、Secret类型
+
+**Secret有三种类型：**
+
+- Opaque：base64编码格式的Secret，用来存储密码、密钥等，但数据也可以通过base64 -descod解码得到原始数据，所以加密行很弱
+
+- kubernetes.io/dockerconfigjson：用来存储私有docker registry的认证信息
+- kubernetes.io/service-account-token：用于 被serviceaccount引用，serviceaccout创建时kubernetes会默认创建对应的secret。Pod如果使用了serviceaccount，对用secret会自动挂载到Pod目录/run/secrets/kubernetes.io/serviceaccount中
+
+### 2.2、Secret参数
+
+**secret可选参数有三种：**
+
+- generic：通用类型，通常用于存储密码数据
+- tls：此类型仅用于存储私钥和证书
+- docker-registry：若要保存docker仓库的认证信息的话，就必须使用此种类型来创建
+
+### 2.3、Secret和ConfigMap这两种资源对象的异同点
+
+- 相同点
+
+key/value的形式
+
+属于某个特定的namespace
+
+可以导出到环境变量
+
+可以通过目录/文件形式挂载
+
+通过volume挂载的配置信息均可热更新
+
+- 不同点
+
+Secret可以被ServerAccount关联
+
+Secret可以存储docker register的签权信息，用在imagePullPolicy参数中，用于拉取私有仓库的镜像
+
+Secret支持Base64加密
+
+Secret分为kubernetes.io/service-account-token、kubernetes.io/dockerconfigjson、Opaque三种类型，而ConfigMap不区分类型
+
+### 2.4、Secret应用
+
+#### 2.4.1、通过环境变量引入
+
+```bash
+# 变量名为passowrd值为123456，类型为generic，资源名字为mysql-password
+[root@master ~]# kubectl create secret generic mysql-password --from-literal=password=123456
+secret/mysql-password created
+
+
+# 查看secret资源
+[root@master ~]# kubectl get secret mysql-password
+NAME             TYPE     DATA   AGE
+mysql-password   Opaque   1      60s
+
+
+# 查看资源的相信信息，数据是加密的
+[root@master ~]# kubectl describe secret mysql-password
+Name:         mysql-password
+Namespace:    default
+Labels:       <none>
+Annotations:  <none>
+
+Type:  Opaque
+
+Data
+====
+password:  6 bytes
+```
+
+```bash
+# 创建Pod使用Secret
+[root@master ~]# cat secret_env.yaml 
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: pod-secret
+  labels:
+    app: myapp
+spec:
+  containers:
+  - name: myapp
+    image: busybox
+    ports:
+     # 端口名称
+    - name: http
+      containerPort: 80
+    command: ["sh","-c","sleep 3600"]
+    env:
+    # 它是Pod启动成功后。Pod容器中的环境变量名字
+    - name: MYSQL_ROOT_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          # 这是secret的对象名
+          name: mysql-password
+          # 这是secret中的键名(Key)
+          key: password
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f secret_env.yaml 
+pod/pod-secret created
+
+
+# 进入Pod里面查看secret是否配置成功
+[root@master ~]# kubectl exec -it pod-secret -- sh
+/ # echo $MYSQL_ROOT_PASSWORD
+123456
+```
+
+#### 2.4.2、通过Volume挂载使用
+
+```bash
+# 使用base64加密数据
+[root@master ~]# echo -n "admin" | base64
+YWRtaW4=
+[root@master ~]# echo -n "123456" | base64
+MTIzNDU2
+
+
+[root@master ~]# cat secret_volume.yaml 
+apiVersion: "v1"
+kind: Secret
+metadata:
+  name: mysecret
+type: Opaque
+data:
+  username: YWRtaW4=
+  password: MTIzNDU2
+---
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: pod-secret-volume
+spec:
+  containers:
+  - name: myapp
+    image: busybox
+    volumeMounts:
+    - name: secret-volume
+      mountPath: /etc/secret
+      readOnly: true
+    command: ["sh","-c","sleep 3600"]
+  volumes:
+  - name: secret-volume
+    secret:
+      secretName: mysecret
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f secret_volume.yaml 
+secret/mysecret created
+pod/pod-secret-volume created
+[root@master ~]# cat secret_volume.yaml 
+apiVersion: "v1"
+kind: Secret
+metadata:
+  name: mysecret
+type: Opaque
+data:
+  username: YWRtaW4=
+  password: MTIzNDU2
+---
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: pod-secret-volume
+spec:
+  containers:
+  - name: myapp
+    image: busybox
+    volumeMounts:
+   # 将名为secret-volume卷挂载到/etc/secret目录上
+    - name: secret-volume卷挂载到
+      mountPath: /etc/secret
+      readOnly: true
+    command: ["sh","-c","sleep 3600"]
+  volumes:
+  - name: secret-volume
+    secret:
+    # 指定卷里面的内容来自于哪里
+      secretName: mysecret
+
+
+[root@master ~]# kubectl exec -it pod-secret-volume -- ls /etc/secret
+password  username
+[root@master ~]# kubectl exec -it pod-secret-volume -- cat /etc/secret/usernameadmin
+[root@master ~]# kubectl exec -it pod-secret-volume -- cat /etc/secret/password123456
+```
+
+## 三、Service
+
+### 3.1、为什么要有Service
+
+- 在Kubernetes中，Pod是由生命周期的，如果Pod重启它的IP很有可能发生变化。如果我们的服务都是将Pod的IP地址写死，Pod挂掉或者重启，和刚才重启的Pod相关联的其他服务将会找不到它所 关联的Pod，为了解决这个问题，在kubernetes中定义了Service资源对象，Service定义了一个服务访问的入口，客户端通过这个入口即可访问服务背后的应用集群实例，service是一组Pod的逻辑集合，这一组Pod能够被service访问到，通常是通过Label selector（标签选择器）实现的
+
+### 3.2、Service概述
+
+- service是一个固定的接入层，客户端可以通过访问service的ip和端口访问到service关联的后端Pod，这个service工作依赖于在kubernetes集群之上部署的一个附件，就是kubernetes的dns服务（不同kubernetes版本的dns默认使用的也是不一样的），1.11之前的版本使用的是kubeDNS，较新的版本使用的是coredns，service的名称解析是依赖于dns福建的，因此部署完k8s之后需要再部署dns附件，kubernetes要想给客户端提供网络功能，需要俩与第三方网络插件（flaanel，calico等）。每个k8s节点上都有一个组件叫做kube-porxy，kube-proxy这个组件将始终监视着apiversion中有关service资源的变动信息，需要跟master之上的apiversion交互，随时连接到apiservic行获取任何一个于service资源有关的资源变动状态，这种是通过kubernetes中固有的一种请求方法watch（监视）来实现的，一旦有service资源的内容发生变动（如创建、删除）kube-proxy都会将它转化成当前节点之上的能够实现service资源调度，把我们请求调度到后端特定的Pod资源之上的规则，这种规则可能是iptables，也可能是ipvs，取决于service的实现方式
+
+### 3.3、Service工作原理
+
+- k8s在创建service时，会根据标签选择器selector（lable selector）来查看Pod。据此创建于Service同名的endpoint（端点）对象，当Pod地址发生变化时，endpoint也会随之发生变化，service接收前端client请求的时候，就会通过endpoint，找到转发哪个Pod进行访问的地址（至于转发到哪个节点的Pod，由负载均衡kube-proxy决定）
+
+### 3.4、Kubernetes集群中有三类IP地址
+
+- Node Network（节点网络）：物理节点或虚拟节点的网络，如ens33接口上的网络地址
+- Pod network（Pod网络）：创建的Pod具有的IP地址
+- Cluster Network（集群地址，也称为service network）：这个地址是虚拟的地址（virtual ip），没有配置在某个接口上，只是出现在service的规则当中
+
+### 3.5、Service代理
+
+- kubernetes service只是把应用对外提供服务的方式做了抽象，真正的应用跑在Pod中的container（容器），我们的请求转发到kubernetes nodes对应的nodePort上，那么nodePort上的请求时如何进一步转发到后台服务的Pod的呢？，就是通过kube-proxy实现的
+- kube-proxy部署在k8s的每一个Node节点上，是Kubenetes的核心组件，我们创建一个service的时候，kube-proxy默认使用的是iptables模式，通过各个node节点上的iptables规则来实现service的负载均衡，但是随着service数量的增大，iptables模式由于线性查找匹配、全量更新等特点，其性能会显著下降。从k8s的1.8版本开始，kube-proxy引入了IPVS模式，IPVS模式于iptables同样基于Netfilter，但是采用的hash表，因此当service数量达到一定规模时，hash查表的速度优势就会明显体现出来，从而提高service的服务性能
+- service是一组Pod的服务抽象，相当于一组Pod的LB（负载均衡），负载将请求转发到对应的Pod。service会为这个LB提供一个IP，一般称为cluster IP。kube-proxy的作用主要时负责service的实现，具体来说，就是实现了内部从Pod到service和外部的从node port向service的访问
+- kube-proxy其实就是管理service的访问入口，包括集群内Pod到Service的访问和集群外部访问service
+- kube-proxy管理service的endpoints（端点），该service对外暴露一个Virtual IP，也可以称为是ClusterIP，集群内通过访问这个Cluster IP:Port就能访问到集群内部的service下的Pod
+
+#### 3.5.1、Kube-proxy的工作模式
+
+**kube-proxy一共有三种工作模式**
+
+- Userpace方式
+
+- iptables
+- ipvs
+
+##### 备注
+
+- 以上不论哪种，kube-proxy都是通过watch的方式监控着apiversion写入etcd中关于Pod的最新状态信息，它一旦检查到一个Pod资源被删除了或者新建了，它将立即将这些变化，反应在iptables或ipvs规则中，以便iptables和ipvs在调度Cluster Pod请求到service Pod时，不会出现Service Pod不存在的情况。自k8s1.11以后service默认使用ipvs规则，若ipvs没有被激活，则降级使用iptables规则
+
+### 3.6、Service服务发现
+
+#### 3.6.1、DNS是什么
+
+- DNS时域名解析系统，是整个互联网的电话簿，它能够将被人理解的域名翻译成被机器理解的IP地址，使得互联网的使用者不再需要直接接触很难阅读和理解的IP地址。域名系统在现在的互联网中非常重要，因为服务器的IP地址可能还会经常变动，如果没有了DNS，那么IP地址一旦发生了更改，当前服务的客户端就没有办法连接到目标服务器了
+
+#### 3.6.2、什么是CoreDNS
+
+- CroeDNS其实就是一个DNS服务，而DNS作为一种常见的服务发现手段，所以很多开源项目以及工程师都会使用CoreDNS为集群提供服务发现的功能，kubernetes'就在集群中使用CoreDNS解决服务发现的问题。作为一个加u人CNCF的服务，CoreDNS的实现非常简单
+
+### 3.7、Service类型
+
+- 常用的serice类型有三种
+
+#### 3.7.1、Cluster IP类型
+
+- 这种类型的Service只会得到虚拟IP和端口，只能在kubernetes集群内部被访问，此模型式为默认类型
+
+```bash
+[root@master ~]# cat service_ClusterIP.yaml 
+apiVersion: "apps/v1"
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      name: tem-nginx
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: test-nginx
+        image: nginx:1.20
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+---
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: nginx
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+  # 指定所有带有标签为app: nginx的pod为这个service的后端
+  selector:
+    app: nginx
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f service_ClusterIP.yaml 
+deployment.apps/nginx created
+service/nginx created
+
+
+# 查看svc（service）服务
+[root@master ~]# kubectl get svc
+NAME         TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)   AGE
+kubernetes   ClusterIP   10.1.0.1      <none>        443/TCP   3d19h
+nginx        ClusterIP   10.1.69.151   <none>        80/TCP    4m38s
+
+
+# 访问测试（ClusterIP类型只能在集群内部访问）
+[root@master ~]# curl 10.1.69.151
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+```
+
+#### 3.7.2、NodePort类型
+
+- 这种类型的Service除了会得到虚拟IP和端口，Kubernetes还会再所有Node节点上为其分配端口，分配端口的值可以通过spec.ports[*].nodePort指定，或由Kubernetes再配置好的区间里面分配（默认为30000-32767）**即可从Kubernetes集群通过虚拟IP:端口访问也可以从集群外部通过Node节点的IP:nodePort访问**
+
+```bash
+[root@master ~]# cat service_NodePort.yaml 
+apiVersion: "apps/v1"
+kind: Deployment
+metadata:
+  name: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      name: tem-nginx
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: test-nginx
+        image: nginx:1.20
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+---
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: nginx
+spec:
+  type: NodePort
+  ports:
+  # 集群内部暴露的端口号
+  - port: 80
+  # 流量将被转发到目标端口号，即Pod上的容器端口号
+    targetPort: 80
+    # 指定所有带有app: nginx标签的Pod成为这个Service的后端服务
+  selector:
+    app: nginx
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f service_NodePort.yaml 
+deployment.apps/nginx created
+service/nginx created
+
+
+# 查看资源
+[root@master ~]# kubectl get svc 
+NAME         TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)        AGE
+kubernetes   ClusterIP   10.1.0.1       <none>        443/TCP        3d20h
+nginx        NodePort    10.1.204.139   <none>        80:31339/TCP   2m54s
+
+
+# 访问测试，windows上的CMD进行访问（集群内所有node的IP加上这个端口号都能被访问到）
+C:\Users\Lenovo>curl -I 192.168.93.101:31339
+HTTP/1.1 200 OK
+Server: nginx/1.20.2
+Date: Fri, 28 Jun 2024 03:24:02 GMT
+Content-Type: text/html
+Content-Length: 612
+Last-Modified: Tue, 16 Nov 2021 14:44:02 GMT
+Connection: keep-alive
+ETag: "6193c3b2-264"
+Accept-Ranges: bytes
+
+
+# 访问Nginx页面（集群内所有node的IP加上这个端口号都能被访问到）
+C:\Users\Lenovo>curl 192.168.93.101:31339
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body {
+        width: 35em;
+        margin: 0 auto;
+        font-family: Tahoma, Verdana, Arial, sans-serif;
+    }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+```
+
+#### 3.7.3、ExternalName类型
+
+- 在Kubernetes（K8S），Service资源的ExternalName类型用于将服务映射到集群外部的名称，而不是通过Cluster或LoadBalancer IP。这对于将内部服务映射到外部服务的域名非常有用。ExternalName类型的Service不会创建任何Endpoint（端点），而只是将服务的DNS记录配置为指定的外部名称
+- 适用于K8S集群内部访问外部资源，它没有selector，也没有定义任何的端口和Endpoint（端点）。以下Service定义的是将prod名称空间中的my-service服务映射到my.database.example.com
+
+```bash
+# 创建prod命名空间
+[root@master ~]# kubectl create ns prod
+namespace/prod created
+
+
+[root@master ~]# cat service_ExternalName.yaml 
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: my-service
+  namespace: prod
+spec:
+  type: ExternalName
+  externalName: my.database.example.com
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f service_ExternalName.yaml 
+service/my-service created
+
+
+# 查看prod命名空间的service
+[root@master ~]# kubectl get svc -n prod
+NAME         TYPE           CLUSTER-IP   EXTERNAL-IP               PORT(S)   AGE
+my-service   ExternalName   <none>       my.database.example.com   <none>    54s
+
+
+# 访问my-service.prod.svc.cluster.local就相当于访问my.database.example.com地址
+```
+
+#### 3.7.4、LoadBalancer类型
+
+- 这种类型的Service除了会得到虚拟的IP和端口，Kubernetes还会在所有Node节点上为其分配端口，然后为其开通负载均衡可以从Kubernetes集群通过虚拟IP:端口访问，也可以从集群外部通过Node节点的IP:nodePort访问，还可以通过负载均衡的IP访问
+
+## 四、Ingress
+
+### 4.1、Ingress介绍
+
+- Ingress官网定义：Ingress可以把进入内部的请求转发到集群中的一些服务上，从而可以把服务映射到集群外部。Ingress能把集群内部Service配置成外网能够访问的URL，流量负载均衡，提供语句访问的虚拟主机等。
+
+- Ingress简单的理解就是你原来需要改Nginx配置，然后配置各种域名对应哪个Service，现在把这个动作抽象出来，变成一个Ingress对象，你可以用YAML创建，每次不要去改Nginx了，直接改YAML然后创建/更新就行了；那么问题来了：Nginx该怎么处理？
+
+- Ingress Controller这东西就是解决Nginx的处理方式的；Ingress Controller通过与Kubernetes API交互，动态的去感知集中中Inress规则变化，然后读取他，按照他自己模板生成一段Nginx的配置，再写道Nginx Pod里，最后reload（重启）一下
+
+### 4.2、Ingress Controller介绍
+
+- Ingress Controller是一个七层负载均衡调度器，客户端的请求先到达七层负载调度器，由七层负载均衡调度器在反向代理到后端Pod，常见的七层负载均衡器由nginx、traefik以我们熟悉的nginx为例，假如请求到达的nginx，会通过upstream反向代理到后端pod应用，但是后端pod的ip地址是一直变化的，因为在后端pod前需要加一个service，这个service只是起到分组的作用，那么我们upstream只需要填写service地址即可。
+
+### 4.3、Ingress和Ingress Controller总结
+
+- Ingress Controller可以理解为控制器，它通过不断的跟kubernetes API交互，实时获取后端Service、Pod的变化，比如新增、删除等，结合Ingress定义的规则生成配置，然后动态更新上边的Nginx或者trafik负载均衡器，并刷新使配置生效，来达到服务自动发现的作用。
+
+- Ingress则使定义规则，通过它定义某个域名的请求过来之后转发到集群中指定Service。它可以通过YAML文件定义，可以给一个或多个Service定义一个或多个Ingress规则
+
+### 4.4、使用Ingress Controller代理K8S内部应用的流程
+
+- 部署Ingress Controller，我们ingress controller使用的是nginx
+- 创建Pod应用，可以通过控制器来创建Pod
+- 创建Service，用来分组Pod
+- 创建Ingress http，测试通过http访问应用
+- 创建Ingress http，测试通过https访问应用
+
+### 4.5、Ingress实现业务灰度发布
+
+#### 4.5.1、常见的版本发布方法
+
+##### 4.5.1.1、蓝绿部署
+
+- 蓝绿部署，是采用两个分开的集群对软件进行升级的一种方式。它的部署模型中包括一个蓝色集群A和一个绿色集群B，在没有新版本上线的情况下，两个集群上运的版本是一致的，同时对外提供服务
+
+**系统升级时，蓝绿部署的流程是：**
+
+- 首先，从负载均衡器列表中删除集群A，让集群B单独提供服务
+- 然后，在集群A上部署新版本
+- 接下来，集群A升级完毕后，把负载均衡列表全部指向A，并删除集群B，由A单独提供服务。
+
+- 在集群B上部署完新版本后，再把它添加回负载均衡列表中
+- 这种我们就完成了两个集群上所有机器的版本升级
+
+**缺点**
+
+- 蓝绿部署它的优点在于发布策略简单、对于用户来说无感知，可以实现升级平滑过渡，但它的缺点也很明显：需要准备正常业务使用资源的两倍以上服务器，需要投入较大的资源成本
+
+##### 4.5.1.2、红黑部署
+
+- 红黑部署是Netfix采用的部署手段，Netfix的主要基础设施是在AWS上，它与蓝绿部署类似，红黑部署也是通过两个集群完成软件版本的升级
+- 当前服务提供的所有机器运行在红色集群A中，当需要发布新版本的时候，具体流程是这样的：
+
+现在云上申请一个黑色集群B，在B上部署新版本的服务
+
+等到B升级完成后，我们一次性把负载均衡全部指向B
+
+把A集群从负载均衡列表中删除，并释放集群A中的所有机器
+
+- 用来云计算的弹性伸缩优势，从而获得了两个收益：一是简化了流程；二是，避免了在升级的过程中，由于只有一般的服务器提供服务，而可能导致的系统挂载问题。
+
+##### 4.5.1.3、灰度发布
+
+- 灰度发布，也被叫做金丝雀发布。与蓝绿部署、红黑不同的是，灰度发布属于增量发布方法。也就是说，服务升级的过程中，新旧版本回同时为用户提供服务。
+- 灰度发布的具体流程是这样的：在集群的一小部分机器上部署新版本，非一部分用户使用，以测试新版本的功能和性能，确认没有问题之后，再对整个集群进行升级。简单地说灰度发布就是把部署好的服务分批次、逐步暴露给越来越多的用户，直到最终完全上线。
+
+- 之所以叫作灰度发布，是因为它介于黑与白之间，并不是版本之间的直接切换，而是一个平滑过度的过程
+- AB Test就是一种灰度发布的方式，让一部分用户继续使用A，一部分用户开始使用B，如果用户B没有什么反对意见，那么逐步扩大范围，把所有用户都迁移到B上面来。灰度发布可以保证整体系统的稳定，在初始灰度的时候就可以发现、调整问题，以保证其影响度，而我们平常所说的金丝雀部署也就是灰度发布的一种方式
+
+- 对于灰度发布来说，它的优点在于如果前期出问题影响范围很小，相对用户体验也少；可以做到及时发现、及时调整问题，影响范围欸可控。但是采取这种模式自动化以及运行监控能力的要求非常高
+
+##### 4.5.1.4、滚动发布
+
+- 滚动发布是指每次只升级一个或多个服务，升级完成后加入生产环境，不断执行这个过过程，直到集群中的全部旧版本升级新版本
+- 这种部署方式相对于蓝绿部署，更加节约资源——它不需要运行两个集群、两倍的实例数。我们可以部分部署，例如每次只去除集群的20%进行升级，比较节约资源，但同时缺点也很明显：采用滚动发布方式部署时，没有一个确定OK的环境。如果使用蓝绿部署，我们能够清晰地直到老版本是OK的，而使用滚动发布，我们无法确定。并且一旦发布过程出现问题，需要回滚，回滚过程非常困难
+
+- 在实际工作当中，升级过程中需要保持服务的连续性、稳定，对外无感知是几个基本的要求。在生产选择哪种部署方式最合适？这取决与哪种方式最适合你的业务和技术需求
+
+### 4.5.2、部署Ingress Controller
+
+- 选择合适的版本，我使用的是Kubernetes 1.23版本，Ingress Controller版本选择为v1.6.4
+
+```bash
+# 部署Ingress Controller
+[root@master ~]# kubectl apply -f deploy.yaml 
+namespace/ingress-nginx created
+serviceaccount/ingress-nginx created
+serviceaccount/ingress-nginx-admission created
+role.rbac.authorization.k8s.io/ingress-nginx created
+role.rbac.authorization.k8s.io/ingress-nginx-admission created
+clusterrole.rbac.authorization.k8s.io/ingress-nginx created
+clusterrole.rbac.authorization.k8s.io/ingress-nginx-admission created
+rolebinding.rbac.authorization.k8s.io/ingress-nginx created
+rolebinding.rbac.authorization.k8s.io/ingress-nginx-admission created
+clusterrolebinding.rbac.authorization.k8s.io/ingress-nginx created
+clusterrolebinding.rbac.authorization.k8s.io/ingress-nginx-admission created
+configmap/ingress-nginx-controller created
+service/ingress-nginx-controller created
+service/ingress-nginx-controller-admission created
+deployment.apps/ingress-nginx-controller created
+job.batch/ingress-nginx-admission-create created
+job.batch/ingress-nginx-admission-patch created
+ingressclass.networking.k8s.io/nginx created
+validatingwebhookconfiguration.admissionregistration.k8s.io/ingress-nginx-admission created
+[root@master ~]# kubectl get pod -n ingress-nginx
+NAME                                        READY   STATUS      RESTARTS   AGE
+ingress-nginx-admission-create-lmlp2        0/1     Completed   0          74s
+ingress-nginx-admission-patch-clqpx         0/1     Completed   2          74s
+ingress-nginx-controller-6cd89cfd57-b6tcg   1/1     Running     0          74s
+```
+
+### 4.5.3、部署两个版本的服务
+
+#### 4.5.3.1、V1版本
+
+```bash
+[root@master ~]# cat nginx_v1.yaml 
+apiVersion: "apps/v1"
+kind: Deployment
+metadata:
+  name: nginx-v1
+spec:
+  replicas: 1
+  selector: 
+    matchLabels:
+      app: nginx
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: nginx
+        version: v1
+    spec:
+      containers:
+      - name: nginx
+        image: "openresty/openresty:centos"
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          protocol: TCP
+          containerPort: 80
+        volumeMounts:
+        - mountPath: /usr/local/openresty/nginx/conf/nginx.conf
+          name: config
+          subPath: nginx.conf
+      volumes:
+      - name: config
+        configMap:
+          name: nginx-v1
+---
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  labels:
+    app: nginx
+    version: v1
+  name: nginx-v1
+data:
+  nginx.conf: |
+    worker_processes  1;
+    events {
+        accept_mutex on;
+        multi_accept on;
+        use epoll;
+        worker_connections  1024;
+    }
+    http {
+        ignore_invalid_headers off;
+        server {
+            listen 80;
+            location / {
+                access_by_lua '
+                    local header_str = ngx.say("nginx-v1")
+                ';
+            }
+        }
+    }
+---
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: nginx-v1
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: nginx
+    version: v1
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_v1.yaml 
+deployment.apps/nginx-v1 created
+configmap/nginx-v1 created
+service/nginx-v1 created
+```
+
+#### 4.5.3.2、V2版本
+
+```bash
+[root@master ~]# cat nginx_v2.yaml 
+apiVersion: "apps/v1"
+kind: Deployment
+metadata:
+  name: nginx-v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: nginx
+        version: v2
+    spec:
+      containers:
+      - name: ningx
+        image: "openresty/openresty:centos"
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          protocol: TCP
+          containerPort: 80
+        volumeMounts: 
+        - mountPath: /usr/local/openresty/nginx/conf/nginx.conf
+          name: config
+          subPath: nginx.conf
+      volumes:
+      - name: config
+        # 使用configmap作为数据源
+        configMap:
+          name: nginx-v2
+---
+apiVersion: "v1"
+kind: ConfigMap
+metadata:
+  labels:
+    app: nginx
+    version: v2
+  name: nginx-v2
+data:
+  nginx.conf: |
+    worker_processes  1;
+    events {
+        accept_mutex on;
+        multi_accept on;
+        use epoll;
+        worker_connections  1024;
+    }
+    http {
+        ignore_invalid_headers off;
+        server {
+            listen 80;
+            location / {
+                access_by_lua '
+                    local header_str = ngx.say("nginx-v2")
+                ';
+            }
+        }
+    }
+---
+apiVersion: "v1"
+kind: Service
+metadata:
+  name: nginx-v2
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    protocol: TCP
+    name: http
+  selector:
+    app: nginx
+    version: v2
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_v2.yaml 
+deployment.apps/nginx-v2 created
+configmap/nginx-v2 created
+service/nginx-v2 created
+```
+
+### 4.5.4、创建Ingress指向V1版本
+
+```bash
+[root@master ~]# cat nginx_ingress.yaml 
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  # 域名
+  - host: canary.example.com
+    http:
+      paths:
+      # 配置访问路径，如果通过url进行转发，需要修改，默认访问路径为"/"
+      - path: / 
+        pathType: Prefix
+      # 配置后端服务
+        backend: 
+          service:
+            name: nginx-v1
+            port: 
+              number: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_ingress.yaml 
+ingress.networking.k8s.io/nginx created
+
+
+# 访问测试
+[root@master ~]# kubectl get svc -n ingress-nginx
+NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.1.23.144    <pending>     80:30391/TCP,443:31064/TCP   41m
+ingress-nginx-controller-admission   ClusterIP      10.1.189.100   <none>        443/TCP                      41m
+
+
+# 访问测试，注意IP地址换成LoadBalancer类型的IP地址
+[root@master ~]# curl -H "Host: canary.example.com" http://10.1.23.144 
+nginx-v1
+```
+
+```bash
+# 或者使用以下方式进行测试
+[root@master ~]# kubectl get svc -n ingress-nginx
+NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.1.23.144    <pending>     80:30391/TCP,443:31064/TCP   44m
+ingress-nginx-controller-admission   ClusterIP      10.1.189.100   <none>        443/TCP                      44m
+
+
+[root@master ~]# kubectl describe svc -n ingress-nginx ingress-nginx-controller
+Namespace:                ingress-nginx
+Labels:                   app.kubernetes.io/component=controller
+                          app.kubernetes.io/instance=ingress-nginx
+                          app.kubernetes.io/name=ingress-nginx
+                          app.kubernetes.io/part-of=ingress-nginx
+                          app.kubernetes.io/version=1.6.4
+Annotations:              <none>
+Selector:                 app.kubernetes.io/component=controller,app.kubernetes.io/instance=ingress-nginx,app.kubernetes.io/name=ingress-nginx
+Type:                     LoadBalancer
+IP Family Policy:         SingleStack
+IP Families:              IPv4
+IP:                       10.1.23.144
+IPs:                      10.1.23.144
+Port:                     http  80/TCP
+TargetPort:               http/TCP
+NodePort:                 http  30391/TCP
+#####################################################################
+Endpoints:                192.168.93.102:80
+#####################################################################
+Port:                     https  443/TCP
+TargetPort:               https/TCP
+NodePort:                 https  31064/TCP
+#####################################################################
+Endpoints:                192.168.93.102:443
+#####################################################################
+Session Affinity:         None
+External Traffic Policy:  Local
+HealthCheck NodePort:     32383
+Events:                   <none>
+
+
+# 根据查到的EngPoints，找一台机器写入hosts解析进行测试
+[root@localhost ~]# echo "192.168.93.102 canary.example.com" >> /etc/hosts
+[root@localhost ~]# curl canary.example.com
+nginx-v1
+```
+
+### 4.5.5、基于Header的流量切片
+
+- 创建Canary Ingress，指定v2版本的后端服务，且加上一些annotation，实现仅将带有名为Region且值为cd或sz的请求头的请求转发给当前Canary Ingress，模拟灰度新版本给成都和深圳地狱的用户。
+
+```bash
+[root@master ~]# cat nginx_canary.yaml 
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-by-header: "Region"
+    nginx.ingress.kubernetes.io/canary-by-header-pattern: "cd|sz"
+  name: nginx-canary
+spec:
+  rules:
+  - host: canary.example.com
+    http:  
+      paths:
+     # 配置访问路径，如果通过url进行转发，需要修改，默认访问的路径为"/"
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-v2
+            port:
+              number: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_canary.yaml 
+ingress.networking.k8s.io/nginx-canary created
+
+
+# 访问测试
+[root@master ~]# kubectl get svc -n ingress-nginx
+NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.1.23.144    <pending>     80:30391/TCP,443:31064/TCP   60m
+ingress-nginx-controller-admission   ClusterIP      10.1.189.100   <none>        443/TCP                      60m
+
+
+# 可以看到，只有header Region为cd或sz的请求才由v2版本服务相应
+[root@master ~]# curl -H "Host: canary.example.com" -H "Region: cd" 10.1.23.144
+nginx-v2
+[root@master ~]# curl -H "Host: canary.example.com" -H "Region: sz" 10.1.23.144 
+nginx-v2
+[root@master ~]# curl -H "Host: canary.example.com" -H "Region: zz" 10.1.23.144 
+nginx-v1
+[root@master ~]# curl -H "Host: canary.example.com" -H "Region: bj" 10.1.23.144 
+nginx-v1
+```
+
+### 4.5.6、基于Cookie的流量切分
+
+- 与前面Header类似，不过使用Cookie就无法自定义value了，这里以模拟灰度成都低于用户为例，仅将带有名为user_from_cd的cookie的请求转发给当前Canary Ingress。**先删除前面基于Header的流量切分的Canary Ingress**，然后创建下面新的Canary Ingress
+
+```bash
+[root@master ~]# kubectl delete -f nginx_canary.yaml 
+ingress.networking.k8s.io "nginx-canary" deleted
+
+
+[root@master ~]# cat nginx_cookie.yaml 
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-by-cookie: "user_from_cd"
+  name: nginx-canary
+spec:
+  rules:
+  - host: canary.example.com
+    http: 
+      paths:
+    # 配置访问路径，如果通过url进行转发，需要修改，默认访问的路径为"/"
+      - path: / 
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-v2
+            port:
+              number: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_cookie.yaml 
+ingress.networking.k8s.io/nginx-canary created
+
+
+# 访问测试，只有cokkie user_from_cd为always的请求才由v2版本的服务响应
+[root@master ~]# curl -s -H "Host: canary.example.com" --cookie "user_from_cd=always" 10.1.23.144
+nginx-v2
+[root@master ~]# curl -s -H "Host: canary.example.com" --cookie "user_from_cd=never" 10.1.23.144
+nginx-v1
+```
+
+### 4.5.7、基于服务权重的流量切分
+
+- 基于服务权重的Canary Ingress就简单了，直接定义需要导入的流量哔哩，这里以导入10%流量到v2版本为例（如果由，先删除之前的canary Ingress）
+
+```bash
+[root@master ~]# cat nginx_canary.yaml 
+apiVersion: "networking.k8s.io/v1"
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+  name: nginx-canary
+spec:
+  rules:
+  - host: canary.example.com
+    http:
+      paths:
+     # 配置访问路径，如果通过url进行转发，需要修改，默认访问的路径为"/"
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-v2
+            port:
+              number: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_canary.yaml 
+ingress.networking.k8s.io/nginx-canary configured
+
+
+# 访问测试
+[root@master ~]# kubectl get svc -n ingress-nginx
+NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.1.23.144    <pending>     80:30391/TCP,443:31064/TCP   79m
+ingress-nginx-controller-admission   ClusterIP      10.1.189.100   <none>        443/TCP                      79m
+
+
+# 可以看到，大概只有十分之一的几率由v2版本的服务响应，符合10%服务权重的设置，可以多访问几次试试
+[root@master ~]# for i in {1..10}; do curl -H "Host: canary.example.com" http://10.1.23.144;done
+nginx-v1
+nginx-v2
+nginx-v1
+nginx-v1
+nginx-v1
+nginx-v1
+nginx-v1
+nginx-v2
+nginx-v1
+nginx-v1
+
+```
+
