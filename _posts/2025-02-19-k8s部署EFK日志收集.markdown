@@ -1099,21 +1099,26 @@ service/kibana-logging          NodePort    10.1.237.34   <none>        5601:321
 
 ### 4.1、打开kibana
 
+![image-20240707193116586](https://github.com/user-attachments/assets/2f10a918-b1e4-447b-9398-e2854747d6b8)
 
 
 ### 4.2、选择数据
 
+![image-20240707193153332](https://github.com/user-attachments/assets/6b26b8a9-6ccc-4e3d-b9a8-f3727923e816)
 
 
 ### 4.3、创建索引
 
 - 输入：`logstash-*`会显示匹配到的资源
 
+![image-20240707193318529](https://github.com/user-attachments/assets/fd9a074f-d0c0-4702-b7ab-d339218e0cca)
 
 
 ### 4.4、添加字段
 
+![image-20240707193357489](https://github.com/user-attachments/assets/883148c9-c6bd-4ab9-9ae2-6f3bd5657563)
 
 
 ### 4.5、打开Discover
+![image-20240707193502566](https://github.com/user-attachments/assets/d9aae4ab-13ab-47a9-bd61-0ded4a90fc41)
 
