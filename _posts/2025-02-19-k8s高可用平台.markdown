@@ -1,0 +1,782 @@
+---
+layout:       post
+title:        "Kubernetes高可用平台"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# 部署Kubernetes高可用平台
+
+[TOC]
+
+## 资源列表
+
+| 操作系统   | 配置 | 主机名  | IP             |
+| ---------- | ---- | ------- | -------------- |
+| CentOS 7.9 | 2C4G | master1 | 192.168.93.101 |
+| CentOS 7.9 | 2C4G | master2 | 192.168.93.102 |
+| CentOS 7.9 | 2G4G | master3 | 192.168.93.103 |
+| CentOS 7.9 | 2C4G | node1   | 192.168.93.104 |
+| CentOS 7.9 | 2C4G | nginx1  | 192.168.93.105 |
+| CentOS 7.9 | 2C4G | nginx2  | 192.168.93.106 |
+
+## 基础环境
+
+- 关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+- 关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/^SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+- 修改主机名
+
+```bash
+hostnamectl set-hostname master1
+hostnamectl set-hostname master2
+hostnamectl set-hostname master3
+hostnamectl set-hostname node1
+hostnamectl set-hostname nginx1
+hostnamectl set-hostname nginx2
+```
+
+## 一、基础环境配置
+
+- 以下操作要在所有节点进行操作，以Master1节点为例进行演示
+
+### 1.1、关闭Swap
+
+```bash
+# 临时关闭
+[root@master1 ~]# swapoff -a
+# 永久关闭
+[root@master1 ~]# sed -i 's/.*swap.*/#&/g' /etc/fstab
+```
+
+### 1.2、添加hosts解析
+
+```bash
+[root@master1 ~]# cat >> /etc/hosts << EOF
+192.168.93.101 master1
+192.168.93.102 master2
+192.168.93.103 master3
+192.168.93.104 node1
+192.168.93.105 nginx1
+192.168.93.106 nginx2
+EOF
+```
+
+### 1.3、桥接IPv4流量传递到iptables的链
+
+```bash
+[root@master1 ~]# modprobe overlay
+[root@master1 ~]# modprobe br_netfilter
+
+[root@master1 ~]# cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+
+[root@master1 ~]# sysctl --system
+```
+
+## 二、配置Kubernetes的VIP
+
+- 所有Nginx节点都要操作，以Nginx1节点为例进行演示
+
+### 2.1、安装Nginx
+
+```bash
+# 安装nginx扩展源
+[root@nginx1 ~]# yum -y install epel-release.noarch 
+
+# 安装nginx服务
+[root@nginx1 ~]# yum -y install nginx
+
+# 安装nginx流模块(反向代理模块)
+[root@nginx1 ~]# yum -y install nginx-mod-stream
+```
+
+### 2.2、修改Nginx配置文件
+
+- 打开nginx配置文件在/etc/nginx/nginx.conf，在events代码段下添加即可
+
+```bash
+[root@nginx1 ~]# vim /etc/nginx/nginx.conf
+# 写在events代码段}这个符号下面
+# 注意修改里面的IP，IP地址填写3台master节点的IP地址
+stream {
+    upstream apiserver {
+      server 192.168.93.101:6443 max_fails=2  fail_timeout=5s weight=1;
+      server 192.168.93.102:6443 max_fails=2  fail_timeout=5s weight=1;
+      server 192.168.93.103:6443 max_fails=2  fail_timeout=5s weight=1;
+    }
+
+    server {
+        listen  6443;
+        proxy_pass apiserver;
+    }
+}
+```
+
+### 2.3、启动服务
+
+```bash
+[root@nginx1 ~]# systemctl start nginx
+[root@nginx1 ~]# systemctl enable nginx
+```
+
+### 2.4、安装Keepalived
+
+- 所有Nginx节点都需要安装
+
+```bash
+yum -y install keepalived
+```
+
+### 2.5、修改配置文件
+
+#### 2.5.1、Nginx1节点配置文件
+
+```bash
+[root@nginx1 ~]# vim /etc/keepalived/keepalived.conf
+! Configuration File for keepalived
+
+global_defs {
+   router_id NGINX1
+}
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/nginx_check.sh"
+    interval 1   # 1秒检查一次
+    weight -2    # 如果脚本失败则priority -2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface ens33
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    track_script {
+        check_nginx
+    }
+    virtual_ipaddress {
+        192.168.93.200/24 # 填写同网段，但是这个IP地址没有被使用
+    }
+}
+```
+
+```bash
+# 创建nginx服务检查脚本
+[root@nginx1 ~]# cat > /etc/keepalived/nginx_check.sh << 'EOF'
+#!/bin/bash
+
+# 获取nginx进程的数量
+num=$(ps -ef | grep nginx | grep process | grep -v grep | wc -l)
+
+if [ "$num" -eq 0 ]
+then
+    systemctl stop keepalived
+fi
+EOF
+
+
+# 添加可执行权限
+[root@nginx1 ~]# chmod +x /etc/keepalived/nginx_check.sh
+```
+
+#### 2.5.2、Nginx2节点配置文件
+
+```bash
+[root@nginx2 ~]# vim /etc/keepalived/keepalived.conf
+! Configuration File for keepalived
+
+global_defs {
+   router_id NGINX2
+}
+
+vrrp_script check_nginx {
+    script "/etc/keepalived/nginx_check.sh"
+    interval 1   # 1秒检查一次
+    weight -2    # 如果脚本失败则priority -2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface ens33
+    virtual_router_id 51
+    priority 90
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass 1111
+    }
+    track_script {
+        check_nginx
+    }
+    virtual_ipaddress {
+        192.168.93.200/24 # 同网段但是没有使用的IP
+    }
+}
+```
+
+```bash
+# 创建nginx服务检查脚本
+[root@nginx2 ~]# cat > /etc/keepalived/nginx_check.sh << 'EOF'
+#!/bin/bash
+
+# 获取nginx进程的数量
+num=$(ps -ef | grep nginx | grep process | grep -v grep | wc -l)
+
+if [ "$num" -eq 0 ]
+then
+    systemctl stop keepalived
+fi
+EOF
+
+
+# 添加可执行权限
+[root@nginx2 ~]# chmod +x /etc/keepalived/nginx_check.sh
+```
+
+#### 2.5.3、启动服务
+
+```bash
+[root@nginx1 ~]# systemctl start keepalived.service 
+[root@nginx1 ~]# systemctl enable keepalived.service
+
+
+[root@nginx2 ~]# systemctl start keepalived.service 
+[root@nginx2 ~]# systemctl enable keepalived.service
+```
+
+```bash
+# nginx1节点会出现VIP地址，nginx2节点暂时没有
+[root@nginx1 ~]# ip a
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000
+    link/ether 00:0c:29:f0:47:e5 brd ff:ff:ff:ff:ff:ff
+    inet 192.168.93.105/24 brd 192.168.93.255 scope global noprefixroute ens33
+       valid_lft forever preferred_lft forever
+#####################################################################
+    inet 192.168.93.200/24 scope global secondary ens33
+#####################################################################
+       valid_lft forever preferred_lft forever
+    inet6 fe80::99c1:74ac:9584:dba4/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+```
+
+## 三、部署Kubernetes
+
+- 所有Kubernetes节点操作包括node1节点，以Master1节点为例进行演示
+
+### 3.1、安装Docker容器运行时
+
+```bash
+[root@master1 ~]# yum install -y yum-utils device-mapper-persistent-data lvm2
+[root@master1 ~]# yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+[root@master1 ~]# yum clean all && yum makecache
+[root@master1 ~]# yum -y install docker-ce docker-ce-cli containerd.io
+
+# 启动服务
+[root@master1 ~]# systemctl start docker
+[root@master1 ~]# systemctl enable docker
+```
+
+### 3.2、配置Docker
+
+```bash
+[root@master1 ~]# cat > /etc/docker/daemon.json << EOF
+{
+"exec-opts": ["native.cgroupdriver=systemd"],
+"registry-mirrors": ["https://8xpk5wnt.mirror.aliyuncs.com"]
+}
+EOF
+
+
+# 加载daemon并重启docker
+[root@master1 ~]# systemctl daemon-reload 
+[root@master1 ~]# systemctl restart docker
+```
+
+### 3.3、安装Kubeadm工具
+
+```bash
+# 配置Kubernetes源
+[root@master1 ~]# cat > /etc/yum.repos.d/kubernetes.repo << EOF
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64
+enabled=1
+gpgcheck=0
+repo_gpgcheck=0
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+
+
+
+# 这里指定了版本号，若需要其他版本的可自行更改
+[root@master1 ~]# yum install -y kubelet-1.23.0 kubeadm-1.23.0 kubectl-1.23.0
+
+
+# 只需要设置kubelet服务为永久开启即可，千万不要启动
+[root@master1 ~]# systemctl enable kubelet.service 
+```
+
+### 3.4、初始化Master节点
+
+- 只需要在Master1节点上操作即可
+
+```bash
+# 生成初始化配置文件
+[root@master1 ~]# kubeadm config print init-defaults > kubeadm-config.yaml
+
+
+# 修改初始化配置文件
+[root@master1 ~]# vim kubeadm-config.yaml
+apiVersion: kubeadm.k8s.io/v1beta3
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  token: abcdef.0123456789abcdef
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: 192.168.93.101	# 修改为本机IP
+  bindPort: 6443
+nodeRegistration:
+  criSocket: /var/run/dockershim.sock
+  imagePullPolicy: IfNotPresent
+  name: master1		# 修改为本地主机名
+  taints: null
+---
+apiServer:
+  timeoutForControlPlane: 4m0s
+apiVersion: kubeadm.k8s.io/v1beta3
+certificatesDir: /etc/kubernetes/pki
+clusterName: kubernetes
+controlPlaneEndpoint: "192.168.93.200:6443"  # 添加控制平面IP也就是VIP地址，没有就添加
+controllerManager: {}
+dns: {}
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+imageRepository: registry.aliyuncs.com/google_containers  # 修改为国内镜像
+kind: ClusterConfiguration
+kubernetesVersion: 1.23.0	# 查看版本是否与安装Kubernetes的一致
+networking:
+  dnsDomain: cluster.local
+  serviceSubnet: 10.96.0.0/12
+  podSubnet: "10.244.0.0/16"	# 添加Pod容器网络插件地址
+scheduler: {}          
+```
+
+```bash
+# 拉取所需镜像，也可以提前准备好镜像进行导入，注意如果导入的话建议导入到k8s所有节点中
+[root@master1 ~]# kubeadm config images pull --config=kubeadm-config.yaml
+W0706 09:06:51.221691    8866 strict.go:55] error unmarshaling configuration schema.GroupVersionKind{Group:"kubeadm.k8s.io", Version:"v1beta2", Kind:"InitConfiguration"}: error unmarshaling JSON: while decoding JSON: json: unknown field "imagePullPolicy"
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-apiserver:v1.23.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-controller-manager:v1.23.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-scheduler:v1.23.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/kube-proxy:v1.23.0
+[config/images] Pulled registry.aliyuncs.com/google_containers/pause:3.6
+[config/images] Pulled registry.aliyuncs.com/google_containers/etcd:3.5.1-0
+[config/images] Pulled registry.aliyuncs.com/google_containers/coredns:v1.8.6
+```
+
+```bash
+# 初始化集群
+[root@master1 ~]# kubeadm init --config kubeadm-config.yaml
+W0706 09:10:47.900752    9256 strict.go:55] error unmarshaling configuration schema.GroupVersionKind{Group:"kubeadm.k8s.io", Version:"v1beta2", Kind:"InitConfiguration"}: error unmarshaling JSON: while decoding JSON: json: unknown field "imagePullPolicy"
+[init] Using Kubernetes version: v1.23.0
+[preflight] Running pre-flight checks
+	[WARNING SystemVerification]: this Docker version is not on the list of validated versions: 26.1.4. Latest validated version: 20.10
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[preflight] This might take a minute or two, depending on the speed of your internet connection
+[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "ca" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local master1] and IPs [10.96.0.1 192.168.93.101 192.168.93.200]
+[certs] Generating "apiserver-kubelet-client" certificate and key
+[certs] Generating "front-proxy-ca" certificate and key
+[certs] Generating "front-proxy-client" certificate and key
+[certs] Generating "etcd/ca" certificate and key
+[certs] Generating "etcd/server" certificate and key
+[certs] etcd/server serving cert is signed for DNS names [localhost master1] and IPs [192.168.93.101 127.0.0.1 ::1]
+[certs] Generating "etcd/peer" certificate and key
+[certs] etcd/peer serving cert is signed for DNS names [localhost master1] and IPs [192.168.93.101 127.0.0.1 ::1]
+[certs] Generating "etcd/healthcheck-client" certificate and key
+[certs] Generating "apiserver-etcd-client" certificate and key
+[certs] Generating "sa" key and public key
+[kubeconfig] Using kubeconfig folder "/etc/kubernetes"
+[kubeconfig] Writing "admin.conf" kubeconfig file
+[kubeconfig] Writing "kubelet.conf" kubeconfig file
+[kubeconfig] Writing "controller-manager.conf" kubeconfig file
+[kubeconfig] Writing "scheduler.conf" kubeconfig file
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Starting the kubelet
+[control-plane] Using manifest folder "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+[etcd] Creating static Pod manifest for local etcd in "/etc/kubernetes/manifests"
+[wait-control-plane] Waiting for the kubelet to boot up the control plane as static Pods from directory "/etc/kubernetes/manifests". This can take up to 4m0s
+[apiclient] All control plane components are healthy after 6.035896 seconds
+[upload-config] Storing the configuration used in ConfigMap "kubeadm-config" in the "kube-system" Namespace
+[kubelet] Creating a ConfigMap "kubelet-config-1.23" in namespace kube-system with the configuration for the kubelets in the cluster
+NOTE: The "kubelet-config-1.23" naming of the kubelet ConfigMap is deprecated. Once the UnversionedKubeletConfigMap feature gate graduates to Beta the default name will become just "kubelet-config". Kubeadm upgrade will handle this transition transparently.
+[upload-certs] Skipping phase. Please see --upload-certs
+[mark-control-plane] Marking the node master1 as control-plane by adding the labels: [node-role.kubernetes.io/master(deprecated) node-role.kubernetes.io/control-plane node.kubernetes.io/exclude-from-external-load-balancers]
+[mark-control-plane] Marking the node master1 as control-plane by adding the taints [node-role.kubernetes.io/master:NoSchedule]
+[bootstrap-token] Using token: abcdef.0123456789abcdef
+[bootstrap-token] Configuring bootstrap tokens, cluster-info ConfigMap, RBAC Roles
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to get nodes
+[bootstrap-token] configured RBAC rules to allow Node Bootstrap tokens to post CSRs in order for nodes to get long term certificate credentials
+[bootstrap-token] configured RBAC rules to allow the csrapprover controller automatically approve CSRs from a Node Bootstrap Token
+[bootstrap-token] configured RBAC rules to allow certificate rotation for all node client certificates in the cluster
+[bootstrap-token] Creating the "cluster-info" ConfigMap in the "kube-public" namespace
+[kubelet-finalize] Updating "/etc/kubernetes/kubelet.conf" to point to a rotatable kubelet client certificate and key
+[addons] Applied essential addon: CoreDNS
+[addons] Applied essential addon: kube-proxy
+
+Your Kubernetes control-plane has initialized successfully!
+
+To start using your cluster, you need to run the following as a regular user:
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Alternatively, if you are the root user, you can run:
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+You can now join any number of control-plane nodes by copying certificate authorities
+and service account keys on each node and then running the following as root:
+
+  kubeadm join 192.168.93.200:6443 --token abcdef.0123456789abcdef \
+	--discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 \
+	--control-plane 
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+kubeadm join 192.168.93.200:6443 --token abcdef.0123456789abcdef \
+	--discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 
+```
+
+```bash
+# 配置master1节点
+[root@master1 ~]# mkdir -p $HOME/.kube
+[root@master1 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@master1 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+### 3.5、Node节点加入集群
+
+- 在master1节点初始化的时候返回信息中最后的命令就是node节点加入集群的命令，将命令复制到node节点执行即可
+
+```bash
+[root@node1 ~]# kubeadm join 192.168.93.200:6443 --token abcdef.0123456789abcdef \
+> --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 
+[preflight] Running pre-flight checks
+	[WARNING SystemVerification]: this Docker version is not on the list of validated versions: 26.1.4. Latest validated version: 20.10
+[preflight] Reading configuration from the cluster...
+[preflight] FYI: You can look at this config file with 'kubectl -n kube-system get cm kubeadm-config -o yaml'
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Starting the kubelet
+[kubelet-start] Waiting for the kubelet to perform the TLS Bootstrap...
+
+This node has joined the cluster:
+* Certificate signing request was sent to apiserver and a response was received.
+* The Kubelet was informed of the new secure connection details.
+
+Run 'kubectl get nodes' on the control-plane to see this node join the cluster.
+```
+
+```bash
+# 如果加入进去的命令找不到了可以在master1节点上生成一个
+[root@master1 ~]# kubeadm token create --print-join-command
+kubeadm join 192.168.93.200:6443 --token erlw7x.b5ikmqtha6aa7tqw --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 
+```
+
+### 3.6、其余Master节点加入集群
+
+#### 3.6.1、Master1节点重新创建token和hash值
+
+```bash
+[root@master1 ~]# kubeadm token create --print-join-command
+kubeadm join 192.168.93.200:6443 --token qx5782.tuypr2tqgg7gp48q --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 
+```
+
+#### 3.6.2、Master1节点重新生成certificate-key
+
+```bash
+[root@master1 ~]# kubeadm init phase upload-certs --upload-certs
+I0706 09:17:38.538815   11359 version.go:255] remote version is much newer: v1.30.2; falling back to: stable-1.23
+[upload-certs] Storing the certificates in Secret "kubeadm-certs" in the "kube-system" Namespace
+[upload-certs] Using certificate key:
+9418974e56f1c191c94259fa640d46ccbdb951b96d5962f5b4cd0fc768e65a06
+```
+
+#### 3.6.3、拼接master身份加入集群的命令
+
+- 将master1生成的token和生成最后的hash值进行拼接
+
+```bash
+kubeadm join 192.168.93.200:6443 --token qx5782.tuypr2tqgg7gp48q --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 --control-plane --certificate-key 9418974e56f1c191c94259fa640d46ccbdb951b96d5962f5b4cd0fc768e65a06
+```
+
+```bash
+# 使用以下命令可以直接获得一个可以Master加入进去的令牌
+[root@master1 ~]# echo "$(kubeadm token create --print-join-command) --control-plane --certificate-key $(kubeadm init phase upload-certs --upload-certs | tail -1)"
+I0706 16:16:46.421463   18254 version.go:255] remote version is much newer: v1.30.2; falling back to: stable-1.23
+W0706 16:16:56.423291   18254 version.go:103] could not fetch a Kubernetes version from the internet: unable to get URL "https://dl.k8s.io/release/stable-1.23.txt": Get "https://dl.k8s.io/release/stable-1.23.txt": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+W0706 16:16:56.423328   18254 version.go:104] falling back to the local client version: v1.23.0
+#####################################################################
+kubeadm join 192.168.93.200:6443 --token va1rss.5nhi7qb3mtb8la4c --discovery-token-ca-cert-hash sha256:932a1a57dc252afd38ee498d381db7a7d503d9ab0cef4bedfa52d6901ce8b7f8  --control-plane --certificate-key b5cb75d85303c403a0c2649a90a256e8bbd87c67f02e722d42f58341604bcae5
+#####################################################################
+```
+
+#### 3.6.4、其他master节点加入集群
+
+```bash
+# master2
+[root@master2 ~]# kubeadm join 192.168.93.200:6443 --token qx5782.tuypr2tqgg7gp48q --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 --control-plane --certificate-key 9418974e56f1c191c94259fa640d46ccbdb951b96d5962f5b4cd0fc768e65a06
+[preflight] Running pre-flight checks
+	[WARNING SystemVerification]: this Docker version is not on the list of validated versions: 26.1.4. Latest validated version: 20.10
+[preflight] Reading configuration from the cluster...
+[preflight] FYI: You can look at this config file with 'kubectl -n kube-system get cm kubeadm-config -o yaml'
+[preflight] Running pre-flight checks before initializing the new control plane instance
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[preflight] This might take a minute or two, depending on the speed of your internet connection
+[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'
+[download-certs] Downloading the certificates in Secret "kubeadm-certs" in the "kube-system" Namespace
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "front-proxy-client" certificate and key
+[certs] Generating "etcd/server" certificate and key
+[certs] etcd/server serving cert is signed for DNS names [localhost master2] and IPs [192.168.93.102 127.0.0.1 ::1]
+[certs] Generating "etcd/peer" certificate and key
+[certs] etcd/peer serving cert is signed for DNS names [localhost master2] and IPs [192.168.93.102 127.0.0.1 ::1]
+[certs] Generating "etcd/healthcheck-client" certificate and key
+[certs] Generating "apiserver-etcd-client" certificate and key
+[certs] Generating "apiserver-kubelet-client" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local master2] and IPs [10.96.0.1 192.168.93.102 192.168.93.200]
+[certs] Valid certificates and keys now exist in "/etc/kubernetes/pki"
+[certs] Using the existing "sa" key
+[kubeconfig] Generating kubeconfig files
+[kubeconfig] Using kubeconfig folder "/etc/kubernetes"
+[kubeconfig] Writing "admin.conf" kubeconfig file
+[kubeconfig] Writing "controller-manager.conf" kubeconfig file
+[kubeconfig] Writing "scheduler.conf" kubeconfig file
+[control-plane] Using manifest folder "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+[check-etcd] Checking that the etcd cluster is healthy
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Starting the kubelet
+[kubelet-start] Waiting for the kubelet to perform the TLS Bootstrap...
+[etcd] Announced new etcd member joining to the existing etcd cluster
+[etcd] Creating static Pod manifest for "etcd"
+[etcd] Waiting for the new etcd member to join the cluster. This can take up to 40s
+The 'update-status' phase is deprecated and will be removed in a future release. Currently it performs no operation
+[mark-control-plane] Marking the node master2 as control-plane by adding the labels: [node-role.kubernetes.io/master(deprecated) node-role.kubernetes.io/control-plane node.kubernetes.io/exclude-from-external-load-balancers]
+[mark-control-plane] Marking the node master2 as control-plane by adding the taints [node-role.kubernetes.io/master:NoSchedule]
+
+This node has joined the cluster and a new control plane instance was created:
+
+* Certificate signing request was sent to apiserver and approval was received.
+* The Kubelet was informed of the new secure connection details.
+* Control plane (master) label and taint were applied to the new node.
+* The Kubernetes control plane instances scaled up.
+* A new etcd member was added to the local/stacked etcd cluster.
+
+To start administering your cluster from this node, you need to run the following as a regular user:
+
+	mkdir -p $HOME/.kube
+	sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+	sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Run 'kubectl get nodes' to see this node join the cluster.
+
+[root@master2 ~]# mkdir -p $HOME/.kube
+[root@master2 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@master2 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+```bash
+# master3
+[root@master3 ~]# kubeadm join 192.168.93.200:6443 --token qx5782.tuypr2tqgg7gp48q --discovery-token-ca-cert-hash sha256:28ffbef6224f555172c7614e12a02bb82278e6a9181aaff2531bdc46184ffab3 --control-plane --certificate-key 9418974e56f1c191c94259fa640d46ccbdb951b96d5962f5b4cd0fc768e65a06
+[preflight] Running pre-flight checks
+	[WARNING SystemVerification]: this Docker version is not on the list of validated versions: 26.1.4. Latest validated version: 20.10
+[preflight] Reading configuration from the cluster...
+[preflight] FYI: You can look at this config file with 'kubectl -n kube-system get cm kubeadm-config -o yaml'
+[preflight] Running pre-flight checks before initializing the new control plane instance
+[preflight] Pulling images required for setting up a Kubernetes cluster
+[preflight] This might take a minute or two, depending on the speed of your internet connection
+[preflight] You can also perform this action in beforehand using 'kubeadm config images pull'
+[download-certs] Downloading the certificates in Secret "kubeadm-certs" in the "kube-system" Namespace
+[certs] Using certificateDir folder "/etc/kubernetes/pki"
+[certs] Generating "etcd/peer" certificate and key
+[certs] etcd/peer serving cert is signed for DNS names [localhost master3] and IPs [192.168.93.103 127.0.0.1 ::1]
+[certs] Generating "etcd/healthcheck-client" certificate and key
+[certs] Generating "etcd/server" certificate and key
+[certs] etcd/server serving cert is signed for DNS names [localhost master3] and IPs [192.168.93.103 127.0.0.1 ::1]
+[certs] Generating "apiserver-etcd-client" certificate and key
+[certs] Generating "apiserver-kubelet-client" certificate and key
+[certs] Generating "apiserver" certificate and key
+[certs] apiserver serving cert is signed for DNS names [kubernetes kubernetes.default kubernetes.default.svc kubernetes.default.svc.cluster.local master3] and IPs [10.96.0.1 192.168.93.103 192.168.93.200]
+[certs] Generating "front-proxy-client" certificate and key
+[certs] Valid certificates and keys now exist in "/etc/kubernetes/pki"
+[certs] Using the existing "sa" key
+[kubeconfig] Generating kubeconfig files
+[kubeconfig] Using kubeconfig folder "/etc/kubernetes"
+[kubeconfig] Writing "admin.conf" kubeconfig file
+[kubeconfig] Writing "controller-manager.conf" kubeconfig file
+[kubeconfig] Writing "scheduler.conf" kubeconfig file
+[control-plane] Using manifest folder "/etc/kubernetes/manifests"
+[control-plane] Creating static Pod manifest for "kube-apiserver"
+[control-plane] Creating static Pod manifest for "kube-controller-manager"
+[control-plane] Creating static Pod manifest for "kube-scheduler"
+[check-etcd] Checking that the etcd cluster is healthy
+[kubelet-start] Writing kubelet configuration to file "/var/lib/kubelet/config.yaml"
+[kubelet-start] Writing kubelet environment file with flags to file "/var/lib/kubelet/kubeadm-flags.env"
+[kubelet-start] Starting the kubelet
+[kubelet-start] Waiting for the kubelet to perform the TLS Bootstrap...
+[etcd] Announced new etcd member joining to the existing etcd cluster
+[etcd] Creating static Pod manifest for "etcd"
+[etcd] Waiting for the new etcd member to join the cluster. This can take up to 40s
+The 'update-status' phase is deprecated and will be removed in a future release. Currently it performs no operation
+[mark-control-plane] Marking the node master3 as control-plane by adding the labels: [node-role.kubernetes.io/master(deprecated) node-role.kubernetes.io/control-plane node.kubernetes.io/exclude-from-external-load-balancers]
+[mark-control-plane] Marking the node master3 as control-plane by adding the taints [node-role.kubernetes.io/master:NoSchedule]
+
+This node has joined the cluster and a new control plane instance was created:
+
+* Certificate signing request was sent to apiserver and approval was received.
+* The Kubelet was informed of the new secure connection details.
+* Control plane (master) label and taint were applied to the new node.
+* The Kubernetes control plane instances scaled up.
+* A new etcd member was added to the local/stacked etcd cluster.
+
+To start administering your cluster from this node, you need to run the following as a regular user:
+
+	mkdir -p $HOME/.kube
+	sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+	sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+Run 'kubectl get nodes' to see this node join the cluster.
+
+[root@master3 ~]# mkdir -p $HOME/.kube
+[root@master3 ~]# sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+[root@master3 ~]# sudo chown $(id -u):$(id -g) $HOME/.kube/config
+```
+
+## 四、部署网络插件
+
+- 在Master1节点执行即可
+
+```bash
+[root@master1 ~]# kubectl apply -f kube-flannel.yaml 
+namespace/kube-flannel created
+clusterrole.rbac.authorization.k8s.io/flannel created
+clusterrolebinding.rbac.authorization.k8s.io/flannel created
+serviceaccount/flannel created
+configmap/kube-flannel-cfg created
+daemonset.apps/kube-flannel-ds created
+```
+
+```bash
+# 拉取镜像，目前是肯定缺少flannel镜像的，拉取命令如下，如果拉取不下来就是用魔法
+# 注意：所有k8s集群节点都需要存在这两个镜像
+docker pull docker.io/flannel/flannel-cni-plugin:v1.1.2
+docker pull docker.io/flannel/flannel:v0.21.5
+```
+
+## 五、验证
+
+### 5.1、查看所有Pod运行状态
+
+- 状态要前部是Running状态，如果没有运行起来，那么大概率是因为镜像没有拉取下来
+
+```bash
+[root@master1 ~]# kubectl get pod -A
+NAMESPACE      NAME                              READY   STATUS    RESTARTS      AGE
+kube-flannel   kube-flannel-ds-7sqv8             1/1     Running   0             9m38s
+kube-flannel   kube-flannel-ds-qpvfc             1/1     Running   0             9m38s
+kube-flannel   kube-flannel-ds-wvn4f             1/1     Running   0             9m38s
+kube-flannel   kube-flannel-ds-xcp9g             1/1     Running   0             9m38s
+kube-system    coredns-6d8c4cb4d-jl9td           1/1     Running   0             23m
+kube-system    coredns-6d8c4cb4d-pp2vt           1/1     Running   0             23m
+kube-system    etcd-master1                      1/1     Running   0             23m
+kube-system    etcd-master2                      1/1     Running   0             13m
+kube-system    etcd-master3                      1/1     Running   0             11m
+kube-system    kube-apiserver-master1            1/1     Running   0             23m
+kube-system    kube-apiserver-master2            1/1     Running   0             13m
+kube-system    kube-apiserver-master3            1/1     Running   0             11m
+kube-system    kube-controller-manager-master1   1/1     Running   1 (13m ago)   23m
+kube-system    kube-controller-manager-master2   1/1     Running   0             13m
+kube-system    kube-controller-manager-master3   1/1     Running   0             11m
+kube-system    kube-proxy-4kmbt                  1/1     Running   0             13m
+kube-system    kube-proxy-72cjh                  1/1     Running   0             23m
+kube-system    kube-proxy-jz2sx                  1/1     Running   0             20m
+kube-system    kube-proxy-x8kjh                  1/1     Running   0             11m
+kube-system    kube-scheduler-master1            1/1     Running   1 (13m ago)   23m
+kube-system    kube-scheduler-master2            1/1     Running   0             13m
+kube-system    kube-scheduler-master3            1/1     Running   0             11m
+```
+
+### 5.2、查看节点状态
+
+```bash
+[root@master1 ~]# kubectl get node
+NAME      STATUS   ROLES                  AGE   VERSION
+master1   Ready    control-plane,master   22m   v1.23.0
+master2   Ready    control-plane,master   12m   v1.23.0
+master3   Ready    control-plane,master   10m   v1.23.0
+node1     Ready    <none>                 19m   v1.23.0
+```
+
+### 5.3、查看集群组件状态
+
+```bash
+[root@master1 ~]# kubectl get cs
+Warning: v1 ComponentStatus is deprecated in v1.19+
+NAME                 STATUS    MESSAGE                         ERROR
+controller-manager   Healthy   ok                              
+scheduler            Healthy   ok                              
+etcd-0               Healthy   {"health":"true","reason":""}   
+```
+
