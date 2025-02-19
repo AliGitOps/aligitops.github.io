@@ -1,0 +1,775 @@
+---
+layout:       post
+title:        "Kubernetes高级功能4"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# Kubernetes 持久化存储
+
+[TOC]
+
+## 一、为什么要做持久化存储
+
+- 在k8s中部署的应用都是以Pod容器的形式运行的，假如我们部署的MySQL、Redis等数据库，需要对这些数据库产生的数据做备份。因为Pod是有生命周期的，如果Pod不挂在数据卷，那Pod删除或重启后这些数据会随之消失，如果想要长久的保留这些数据就要用到Pod数据持久化存储。
+
+## 二、都有哪些存储
+
+### 2.1、emptyDir
+
+#### 2.1.1、什么是emptyDir
+
+- emptyDir是一个临时存储卷，与Pod的声明周期绑定在一起，如果Pod被删除了，这意味着数据也被随之删除。
+
+#### 2.1.2、emptyDir作用
+
+- 可以实现持久化
+- 同一个Pod的多个容器可以实现数据共享，多个不同的Pod之间不能进行数据通信
+- 随着Pod的生命周期而存在，当我们删除Pod时，其数据也会被随之删除
+
+#### 2.1.3、emptyDir的应用场景
+
+- 临时缓存空间，比如基于磁盘的归并排序
+- 为较耗时计算任务提供检查点，以便任务能方便的从崩溃前状态恢复执行
+- 存储Web访问日志及错误日志等信息
+
+#### 2.1.4、emptyDir优缺点
+
+​		**优点**
+
+- 可以实现同一个Pod内多个容器之间数据共享
+- 当Pod内的某个容器被强制删除时，数据并不会丢失，因为Pod没有删除
+
+​		**缺点**
+
+- 当Pod被删除时，数据也会随之删除
+- 不同的Pod之间无法实现数据共享
+
+#### 2.1.5、emptyDir的使用方式
+
+```bash
+[root@master ~]# cat emptyDir.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+spec:
+  containers:
+  - name: test-pod
+    image: busybox:1.28
+    imagePullPolicy: IfNotPresent
+    # 定义容器内的挂载点
+    volumeMounts:
+    # 挂载的卷名称未data
+    - name: data
+    # 将data数据卷挂载到内容内部的/opt目录下
+      mountPath: /opt/
+    command: ["sh","-c","sleep 1000"]
+  # 创建一个卷
+  volumes:
+  # 卷名字叫data，刚好与容器挂载的卷名字一致
+  - name: data
+  # emptyDir是一个空目录，用于临时存储数据。{}表示使用默认配置
+    emptyDir: {}
+```
+
+```bash
+# 查看临时目录存在的位置，可用如下方法
+[root@master ~]# kubectl get pod -o wide
+NAME   READY   STATUS    RESTARTS   AGE   IP           NODE    NOMINATED NODE   READINESS GATES
+test   1/1     Running   0          32s   10.244.2.2   node1   <none>           <none>
+
+
+# 查看 Pod 的 uid，指定的机器指定目录下会生成带有 uid 号的目录
+[root@master ~]# kubectl get pod test -o yaml | grep uid
+  uid: b6b8a98d-9324-4869-a443-4e7dbe24f232
+
+
+# 登录 node1 机器
+[root@node1 ~]# tree /var/lib/kubelet/pods/b6b8a98d-9324-4869-a443-4e7dbe24f232/
+/var/lib/kubelet/pods/b6b8a98d-9324-4869-a443-4e7dbe24f232/
+├── containers
+│   └── test-pod
+│       └── 2e82889a
+├── etc-hosts
+├── plugins
+│   └── kubernetes.io~empty-dir
+│       ├── data
+│       │   └── ready
+│       └── wrapped_kube-api-access-n7cgv
+│           └── ready
+└── volumes
+    ├── kubernetes.io~empty-dir
+    │   └── data
+    └── kubernetes.io~projected
+        └── kube-api-access-n7cgv
+            ├── ca.crt -> ..data/ca.crt
+            ├── namespace -> ..data/namespace
+            └── token -> ..data/token
+
+11 directories, 7 files
+```
+
+```bash
+# 在容器里面写文件，对应的emptyDir目录会有相应文件
+[root@master ~]# kubectl exec -it test -- sh -c 'date > /opt/time.txt'
+[root@master ~]# kubectl exec -it test -- ls /opt/time.txt
+/opt/time.txt
+[root@master ~]# kubectl exec -it test -- cat /opt/time.txt
+Fri Jul  5 00:25:52 UTC 2024
+
+
+# 登录到node1机器查看
+[root@node1 ~]# cat /var/lib/kubelet/pods/b6b8a98d-9324-4869-a443-4e7dbe24f232/volumes/kubernetes.io~empty-dir/data/time.txt 
+Fri Jul  5 00:25:52 UTC 2024
+```
+
+### 2.2、hostPath
+
+#### 2.2.1、什么是hostPath
+
+- hostPath Volume是指Pod挂载宿主机上的目录或文件。hostPath Volume使得容器可以使用宿主机的文件系统进行存储，hostpath（宿主机路径）：节点级别的存储卷，在Pod被删除，这个存储卷还是存在的，不会被删除，所以只要同一个Pod被调度到同一个节点上来，在Pod被删除重新被调度到这个节点之后，对应的数据依然存在的
+
+#### 2.2.2、hostPath应用场景
+
+- Pod中容器想要访问宿主机文件
+
+#### 2.2.3、hostPath优缺点
+
+​		**优点**
+
+- 可以实现同一个Pod不同容器之间的数据共享
+- 可以实现同一个Node节点不同Pod之间的数据共享
+
+​		**缺点**
+
+- 无法满足跨节点Pod之间的数据共享
+
+#### 2.2.4、hostPath的使用方式
+
+```bash
+[root@master ~]# cat hostPath.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+spec:
+  containers:
+  - name: test-pod
+    image: busybox:1.28
+    imagePullPolicy: IfNotPresent
+    # 定义容器内部的挂载点
+    volumeMounts:
+    # 挂载卷的名字叫 data
+    - name: data
+    # 叫 data 卷挂载到容器中/opt
+      mountPath: /opt
+    # 容器执行的命令，主要是让容器运行
+    command: ["sh","-c","sleep 1000"]
+  # 定义了Pod中挂载的卷
+  volumes:
+  # 卷的名称
+  - name: data
+  # 指定宿主机的卷存储路径
+    hostPath: 
+  # 宿主机上的路径，这个Pod被分配到什么Node节点，那么就会自动在该Node节点/下面创建data目录
+      path: "/data"
+  # 卷类型，意味着如果宿主机上/data目录不存在Kubernetes会自动创建它
+      type: DirectoryOrCreate
+```
+
+```bash
+[root@master ~]# kubectl apply -f hostPath.yaml 
+pod/test created
+
+
+# 在容器当中写入数据，对应Node节点/data目录下就会出现数据，最终实现持久化存储
+[root@master ~]# kubectl exec -it test -- sh -c 'date > /opt/time.txt'
+[root@master ~]# kubectl exec -it test -- cat /opt/time.txt
+Fri Jul  5 00:39:34 UTC 2024
+[root@master ~]# kubectl get pod -o wide
+NAME   READY   STATUS    RESTARTS   AGE     IP           NODE    NOMINATED NODE   READINESS GATES
+test   1/1     Running   0          5m54s   10.244.1.4   node2   <none>           <none>
+
+
+# 登录 node2 机器查看
+[root@node2 ~]# ls /data/
+time.txt
+[root@node2 ~]# cat /data/time.txt 
+Fri Jul  5 00:39:34 UTC 2024
+```
+
+### 2.3、PV以及PVC
+
+- 前面和大家一起学习了一些基本的资源对象的使用方法，前面我们也和大家降到了有状态的应用和数据有持久化的应用，我们有通过hostPath 或者 emptyDir的方式来持久化我们的数据，但是显然我们还需要更加可靠的存储保存应用持久化数据，这样的容器在重建后，依赖可以使用之前的数据。但是显然存储资源和CPU资源以及内存资源有很多大不同，为了屏蔽底层的技术实现细节，让用户更加方便的使用，Kubernetes便引入了PV和PVC两个重要的资源对象来实现对存储的管理。这也是我们这节课和大家讲解的核心：PV 和 PVC
+
+#### 2.3.1、什么是PV
+
+- PV的全称是：PersistentVolume（持久化卷），是对底层的共享存储的一种抽象，PV由管理员进行创建和配置，它和具体的底层的共享存储技术的实现方式有关，比如Ceph、GlusterFS、NFS等，都是通过插件机制完成与共享存储的对接。
+- PersistentVolume（PV）是集群中的一块存储，由管理员配置或使用存储类动态配置。它是集群中的资源，就像Pod是K8S集群资源一样。PV是容量插件，入Volumes，其声明周期独立于使用PV的任务单个Pod
+
+#### 2.3.2、什么是PVC
+
+- PersistentVolumeClaim（PVC）是一个持久化存储卷，我们在创建Pod时可以定义这个类型的存储卷。它类似于一个Pod。Pod消耗节点的资源，PVC消耗PV资源。Pod可以请求特定级别的资源（CPU和内存）。pvc在申请pv的时候也可以请求特定大小和访问模式（例如，可以依次读写或多次只读）
+
+#### 2.3.3、PV的供应方式
+
+​		**可以通过两种方式配置PV：静态或动态**
+
+- 静态的：
+
+​		集群管理员创建了许多PV，它们包含可供集群用户使用的实际存储的详细信息。它们存在于Kubernetes API中，可供使用
+
+- 动态的：
+
+​		当管理员创建PV都不匹配用户的PersistentVolumeClaim（PVC）时，集群可能会尝试为PVC专门动态配置卷。此配置基于StorageClasses，PVC必须请求存储类，管理员必须创建并配置该类，以便进行动态配置。
+
+#### 2.3.4、绑定
+
+- 用户创建pvc并指定需要的资源和访问模式。在找到可用pv之前，pvc会保持未绑定状态
+
+- 每个持久卷会处于以下阶段（Phase）之一：
+
+  **Available**
+
+  卷是一个空闲资源，尚未绑定到任何申领
+
+  **Bound**
+
+  该卷已经绑定到某申领
+
+  **Released**
+
+​        所绑定的申领已被删除，但是关联存储资源尚未被集群回收
+
+​        **Failed**
+
+​		卷的自动回收操作失败
+
+#### 2.3.5、使用流程
+
+- 需要主调一个存储服务器，把它划分成多个存储空间
+- K8S管理员可以把这些存储空间定义成多个PV
+- 在Pod中使用PVC类型的存储卷之前需要先创建PVC，通过定义需要使用的PV的大小和对应的访问模式，找到合适的PV
+
+- PVC被创建之后，就可以当成存储卷来使用了，我们在定义Pod时就可以使用这个PVC的存储卷
+- PVC和PV它们时一一对应的关系，PV如果被PVC绑定了，就不能被其他PVC使用了
+- 我们在创建PVC的时候，应该确保和底下的PV能绑定，如果没有合适的PV，那么PVC就会处于pending（等待）状态
+
+#### 2.3.6、回收策略
+
+- 我们创建Pod时如果使用PVC做为存储卷，那么它会和PV绑定，当删除Pod，PVC和PV绑定就会解除，解除之后和PVC绑定的PV卷里的数据需要怎么处理，目前，卷可以保留，回收或删除：
+
+​		**Retain**
+
+​		当删除PVC的时候，PV仍然存在，处于released状态，但是它不能被其他PVC绑定使用，里面的数据还是存在的，当我们下次再使用的时候，数据还是存在的，这个是默认的回收策略
+
+​		**Recycle** 简单擦除（rm -rf /thevolume/*）
+
+​        **Delete**
+
+​		删除PVC时即会从Kubernetes中移除PV，也会从相关的外部设施中删除存储资产
+
+#### 2.3.7、访问模式
+
+- PersistentVolume（PV）卷可以用资源提供者所支持的任何方式挂载到宿主系统上。如下表所示，提供者（驱动）的能力不同，每个PV卷的访问模式都会设置为对应卷所支持的模式值。例如，NFS可以支持多个读写客户，但是某个特定的NFS PV卷可能在服务器上以只读的方式导出。每个PV卷都会获得自身的访问模式集合，描述的是特定PV卷的能力
+
+- 访问模式有：
+
+​		**ReadWriteOnce**
+
+​		卷可以被一个节点以读写方式挂载。ReadWriteOnce访问模式也允许运行在同一节点上的多个Pod访问卷
+
+​		**ReadOnlyMant**
+
+​		卷可以被多个节点以只读方式挂载
+
+​		**ReadWriteMany**
+
+​		卷可以被多个节点以读写方式挂载
+
+​		**ReadWriteOncePod**
+
+​		特性状态：Kubernetes v1.27[beat]
+
+​		卷可以被单个Pod以读写方式挂载。如果你想确保整个集群中只有一个Pod可以读取或写入该PVC，请使用 ReadWriteOncePod访问模式。这只支持CSI卷以及需要kubernetes 1.22以上版本
+
+**在命令行接口（CLI）中，访问模式也使用以下缩写形式：**
+
+- RWO -ReadWriteOnce
+- ROX  -ReadOnlyMany
+
+- RWX -ReadWriteMany
+- RWOP -ReadWriteOncePod
+
+#### 2.3.8 示例
+
+- 这里面为了方便演示，决定使用相对简单的NFS这种存储资源
+
+##### 2.3.8.1、资源列表
+
+- 这里面Kubernetes集群由Master、Node1、Node2节点组成，本节课不在演示Kubernetes的部署了，只解释NFS的部署，以及配置PV、PVC相关内容
+
+| 操作系统   | 主机名 | 配置 | IP             |
+| ---------- | ------ | ---- | -------------- |
+| CentOS 7.9 | master | 2C4G | 192.168.93.101 |
+| CentOS 7.9 | node1  | 2C4G | 192.168.93.102 |
+| CentOS 7.9 | node2  | 2C4G | 192.168.93.103 |
+| CentOS 7.9 | nfs    | 2C4G | 192.168.93.104 |
+
+##### 2.3.8.2、部署NFS
+
+- NFS节点操作
+
+###### 2.3.8.2.1、关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+###### 2.3.8.2.2、关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/.*SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+###### 2.3.8.2.3、安装
+
+```bash
+[root@nfs ~]# yum -y install nfs-utils rpcbind
+[root@nfs ~]# mkdir -p /data/volumes
+[root@nfs ~]# cat > /etc/exports << EOF
+/data/volumes 192.168.93.0/24(rw,no_root_squash)
+EOF
+[root@nfs ~]# systemctl enable nfs --now
+```
+
+```bash
+# 所有Kubernetes集群中的节点需要安装以下软件包用以支持NFS
+yum -y install nfs-utils rpcbind
+```
+
+##### 2.3.8.3、PV、PVC应用示例
+
+- 该yaml文件一共创建了3个资源，分别是PV、PVC、Pod
+- 启动PV的名字叫test-pv，指定的存储大小是1G（从NFS的/data/volumes分配的空间），回收策略是Delete，访问模式是ReadWriteMany
+- PVC叫test-pvc，请求的存储是1G，访问模式是ReadWriteMany
+- Pod挂载test-pvc这个PVC到/opt目录
+
+```bash
+[root@master ~]# cat pv-pvc-test.yaml 
+apiVersion: v1
+# 定义资源对象（PV）
+kind: PersistentVolume
+metadata:
+# PV的名字
+  name: test-pv
+spec:
+# 定义持久卷的存储容量，这里是1G
+  capacity:
+    storage: 1G
+  # 定义回收策略
+  persistentVolumeReclaimPolicy: Delete
+  # 定义访问模式
+  accessModes: ["ReadWriteMany"]
+  # 指定持久卷的后端存储是NFS
+  nfs:
+  # NFS服务器上的路径
+    path: /data/volumes
+  # NFS服务器的IP地址
+    server: 192.168.93.104
+---
+apiVersion: v1
+# 定义资源对象（PVC）
+kind: PersistentVolumeClaim
+metadata:
+# PVC的名字
+  name: test-pvc
+spec:
+  # ReadWriteMany表示PVC期望的访问模式与PV匹配
+  accessModes: ["ReadWriteMany"]
+  # 定义PVC所需的存储资源
+  resources:
+  # PVC请求的最小存储容量
+    requests:
+      storage: 1G
+   # PVC促成农户资源上限（不能超过1G）
+    limits:
+      storage: 1G
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test
+spec:
+  containers:
+  - name: test-pod
+    image: busybox:1.28
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+    - name: data
+      mountPath: /opt
+    command: ["sh","-c","sleep 1000"]
+  volumes:
+  # 定义存储卷的名字
+  - name: data
+    persistentVolumeClaim:
+    # claimName：test-pvc表明这个卷使用名为test-pvc的持久化声明
+      claimName: test-pvc
+```
+
+```bash
+[root@master ~]# kubectl apply -f pv-pvc-test.yaml 
+persistentvolume/test-pv created
+persistentvolumeclaim/test-pvc created
+pod/test created
+```
+
+```bash
+# 查看Pod
+[root@master ~]# kubectl get pod
+NAME   READY   STATUS    RESTARTS   AGE
+test   1/1     Running   0          15s
+
+
+# 查看PVC
+[root@master ~]# kubectl get pvc
+NAME       STATUS   VOLUME    CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+test-pvc   Bound    test-pv   1G         RWX                           27s
+
+
+# 查看PV
+[root@master ~]# kubectl get pv
+NAME      CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM              STORAGECLASS   REASON   AGE
+test-pv   1G         RWX            Delete           Bound    default/test-pvc                           56s
+```
+
+```bash
+# 查看PVC相关信息
+[root@master ~]# kubectl describe pvc test-pvc
+Name:          test-pvc
+Namespace:     default
+StorageClass:  
+Status:        Bound
+Volume:        test-pv
+Labels:        <none>
+Annotations:   pv.kubernetes.io/bind-completed: yes
+               pv.kubernetes.io/bound-by-controller: yes
+Finalizers:    [kubernetes.io/pvc-protection]
+Capacity:      1G
+Access Modes:  RWX
+VolumeMode:    Filesystem
+Used By:       test
+Events:        <none>
+
+
+# 查看PV相关信息
+[root@master ~]# kubectl describe pvc test-pv
+Name:          test-pvc
+Namespace:     default
+StorageClass:  
+Status:        Bound
+Volume:        test-pv
+Labels:        <none>
+Annotations:   pv.kubernetes.io/bind-completed: yes
+               pv.kubernetes.io/bound-by-controller: yes
+Finalizers:    [kubernetes.io/pvc-protection]
+Capacity:      1G
+Access Modes:  RWX
+VolumeMode:    Filesystem
+Used By:       test
+Events:        <none>
+```
+
+```bash
+# 写入数据进行验证
+[root@master ~]# kubectl exec -it test -- sh -c 'date > /opt/time.txt'
+
+[root@master ~]# kubectl exec -it test -- cat /opt/time.txt
+Fri Jul  5 01:55:08 UTC 2024
+```
+
+```bash
+# 查看Pod被被配到那个node节点上
+[root@master ~]# kubectl get pod -o wide
+NAME   READY   STATUS    RESTARTS   AGE    IP           NODE    NOMINATED NODE   READINESS GATES
+test   1/1     Running   0          4m3s   10.244.1.5   node2   <none>           <none>
+
+
+# 登录到node2
+[root@nfs ~]# cat /data/volumes/time.txt 
+Fri Jul  5 01:55:08 UTC 2024
+```
+
+## 三、Storageclass存储类动态生成存储
+
+- 上面介绍的PV和PVC模式都需要先创建号PV，然后定义好PVC和PV进行一对一的Bond（绑定），但是如果PVC请求成千上万，那么就需要创建成千上万的PV，对于运维人员来说维护成本很高，Kubernetes提供了一种自动创建PV的机制，叫StorageClass，它的作用就是创建PV的模板。K8S集群管理员通过创建Storageclass可以动态生成一个存储卷PV供K8S PVC使用
+
+### 3.1、StorageClass介绍
+
+- 每个StorageClass都包含字段provisioner，parameters和reclaimPolicy
+- 具体来说，StorageClass会定义以下两部分：
+
+​		PV的属性，比如存储的大小、类型等
+
+​		创建这种PV需要使用到的存储插件，比如Ceph、NFS等
+
+- 有了这两部分信息，Kubernetes就能够根据用户提交的PVC，找到对应的StorageClass，然后Kubernetes就会调用StorageClass声明的存储插件，创建出需要的PV
+
+### 3.2、StorageClass示例
+
+#### 3.2.1、资源列表
+
+| 操作系统   | 主机名 | 配置 | IP             |
+| ---------- | ------ | ---- | -------------- |
+| CentOS 7.9 | master | 2C4G | 192.168.93.101 |
+| CentOS 7.9 | node1  | 2C4G | 192.168.93.102 |
+| CentOS 7.9 | node2  | 2C4G | 192.168.93.103 |
+| CentOS 7.9 | nfs    | 2C4G | 192.168.93.104 |
+
+#### 3.2.2、准备NFS
+
+- NFS节点操作
+
+##### 3.2.2.1、关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+##### 3.2.2.2、关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/.*SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+##### 3.2.2.3、安装
+
+```bash
+[root@nfs ~]# yum -y install nfs-utils rpcbind
+[root@nfs ~]# mkdir -p /data/nfs_pro
+[root@nfs ~]# cat >> /etc/exports << EOF
+/data/nfs_pro 192.168.93.0/24(rw,no_root_squash)
+EOF
+[root@nfs ~]# systemctl restart nfs
+```
+
+```bash
+# 所有Kubernetes集群中的节点需要安装以下软件包用以支持NFS
+yum -y install nfs-utils rpcbind
+```
+
+#### 3.2.3、部署供应商
+
+- 该yaml文件里面指定了NFS节点的地址，以及使用NFS节点的哪个目录。需要替换成自己的
+
+```bash
+[root@master ~]# cat nfs-provisioner.yaml
+# 表示使用Kubernetes核心API的v1版本
+apiVersion: v1
+# ServiceAccount表示这是一个服务账户资源，用于定义运行在Pod中的进程可以访问权限
+kind: ServiceAccount
+metadata:
+# 服务账户的名称
+  name: nfs-provisioner
+---
+# 表示使用基于角色的访问控制（RBAC）的v1版本
+apiVersion: rbac.authorization.k8s.io/v1
+# 表示这是一个集群角色绑定资源，用于将角色（CLusterRole）绑定到一个或多个用户或组
+kind: ClusterRoleBinding
+# 这是集群角色绑定的名称
+metadata:
+  name: nfs-provisioner-clusterrolebinding
+# 指定了要绑定的角色
+roleRef:
+# rbac.authorization.k8s.io是角色所在的API组
+  apiGroup: rbac.authorization.k8s.io
+# 表示这是一个集群级别的角色
+  kind: ClusterRole
+# cluster-admin是要绑定的角色，这里给予了nfs-provisioner服务账户非常高的权限
+  name: cluster-admin
+# 指定了绑定到这个角色用户或组
+subjects:
+# ServiceAccount表示这是一个服务账户
+- kind: ServiceAccount
+# 服务账号的名称
+  name: nfs-provisioner
+# 指定了服务账户所在的命名空间，这里是默认的命名空间
+  namespace: default
+---
+# 表示这是一个部署资源，用于管理无状态应用的Pod
+kind: Deployment
+# apps/v1表示使用应用工作负载API的v1版本
+apiVersion: apps/v1
+metadata:
+# Deployment的名字
+  name: nfs-provisioner
+# 定义了部署的规格
+spec:
+# 定义了如何识别由这个部署管理的Pod
+  selector:
+# 指定了Pod必须具有的标签
+    matchLabels:
+      app: nfs-provisioner
+# 表示Deployment将运行一个Pod副本
+  replicas: 1
+# 定义了Pod的更新策略
+  strategy:
+# 表示在更新时先删除除旧的Pod，然后创建新的Pod
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: nfs-provisioner
+    # 定义Pod的规格
+    spec:
+    # nfs-provisioner指定了Pod将使用的账户
+      serviceAccount: nfs-provisioner
+      containers:
+      - name: nfs-provisioner
+    # 指定了容器的镜像，这里是一个NFS外部卷预配器的镜像
+        image: registry.cn-beijing.aliyuncs.com/mydlq/nfs-subdir-external-provisioner:v4.0.0
+        # 定义了容器内部的挂载点
+        volumeMounts: 
+        # nfs-client-root挂载卷的名字
+        - name: nfs-client-root
+        # 将卷挂载到容器内部的目录/persistentvolumes
+          mountPath: /persistentvolumes
+        # 定义了容器的环境变量
+        env:
+        # 定义了预配器的名称，这是动态卷预配的关键
+          - name: PROVISIONER_NAME
+            value: example.com/nfs 
+          # NFS_SERVER和NFS_PATH定义了NFS服务器的地址和路径，预配器将从中创建新的NFS持久化
+          - name: NFS_SERVER
+            value: 192.168.93.104
+          - name: NFS_PATH
+            value: /data/nfs_pro
+      # 定义Pod中的挂载卷
+      volumes:
+      # 卷的名字，与容器挂载点中的名字相匹配
+        - name: nfs-client-root
+        # 定义了NFS卷的类型和配置
+          nfs:
+          # server和path分别是NFS服务器的地址和路径，与环境变量中的值相同
+            server: 192.168.93.104
+            path: /data/nfs_pro
+```
+
+```bash
+[root@master ~]# kubectl apply -f nfs-provisioner.yaml 
+serviceaccount/nfs-provisioner created
+clusterrolebinding.rbac.authorization.k8s.io/nfs-provisioner-clusterrolebinding created
+deployment.apps/nfs-provisioner created
+```
+
+#### 3.2.4、创建StorageClass
+
+```bash
+[root@master ~]# cat StorageClass.yaml 
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+metadata:
+  name: nfs
+# 注意：provisioner处写的example.com/nfs应该跟安装nfs provisioner时候的env下的PROVISIONER_NAME的value值保持一致，如下
+provisioner: example.com/nfs
+allowVolumeExpansion: true		# 允许动态扩容
+```
+
+```bash
+[root@master ~]# kubectl apply -f StorageClass.yaml 
+storageclass.storage.k8s.io/nfs created
+```
+
+#### 3.2.5、创建PVC
+
+```bash
+[root@master ~]# cat pvc.yaml 
+# 定义一个PVC资源对象
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: test-claim1
+spec:
+# 访问模式ReadWriteMany表示这个卷可以被多个节点以读写的模式挂载。这是NFS存储的一个常见特性
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+    # storage: 1G表示指定了这个PVC请求的存储量大小为1G
+      storage: 1G
+  # nfs指定了这个PVC应用使用的存储类（StorageClass）的名称
+  storageClassName: nfs
+```
+
+```bash
+[root@master ~]# kubectl apply -f pvc.yaml 
+persistentvolumeclaim/test-claim1 created
+```
+
+#### 3.2.6、Pod使用PVC
+
+```bash
+[root@master ~]# cat test-pvc-pod.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-pvc-pod
+  labels:
+    app: busybox
+spec:
+  containers:
+  - name: busybox
+    image: busybox:1.28
+    imagePullPolicy: IfNotPresent
+    command: ["sh","-c","sleep 3600"]
+    volumeMounts: 
+    - name: data
+      mountPath: /opt
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+    # test-claim1是这个卷将要使用的PVC的名字，这告诉Kubernetes，当Pod被调度到某个节点上时，它应该使用名为test-claim1的PVC来挂在一个持久化到Pod中的/opt目录
+      claimName: test-claim1
+```
+
+```bash
+[root@master ~]# kubectl apply -f test-pvc-pod.yaml 
+pod/test-pvc-pod created
+```
+
+```bash
+[root@master ~]# kubectl get pod
+NAME                               READY   STATUS    RESTARTS   AGE
+nfs-provisioner-77cdc7f549-z8csl   1/1     Running   0          31m
+test-pvc-pod                       1/1     Running   0          46s
+```
+
+```bash
+# pv和pvc将会自动绑定
+[root@master ~]# kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                 STORAGECLASS   REASON   AGE
+pvc-5c73d02d-1083-4d2c-85c7-85c5645c6087   1G         RWX            Delete           Bound    default/test-claim1   nfs                     14m
+[root@master ~]# kubectl get pvc
+NAME          STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+test-claim1   Bound    pvc-5c73d02d-1083-4d2c-85c7-85c5645c6087   1G         RWX            nfs            14m
+```
+
+```bash
+# 在容器里面写个文件，NFS服务器的指定目录下就会有这个 
+[root@master ~]# kubectl exec -it test-pvc-pod -- sh -c 'date > /opt/time.txt'
+[root@master ~]# kubectl exec -it test-pvc-pod -- cat /opt/time.txt
+Fri Jul  5 03:15:59 UTC 2024
+
+
+# 登录到NFS服务器查看
+[root@nfs ~]# cat /data/nfs_pro/default-test-claim1-pvc-5c73d02d-1083-4d2c-85c7-85c5645c6087/time.txt 
+Fri Jul  5 03:15:59 UTC 2024
+```
+
