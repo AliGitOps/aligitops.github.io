@@ -485,17 +485,22 @@ kuboard-v3   NodePort   10.100.37.106   <none>        80:30080/TCP,10081:30081/T
 - 默认用户名：admin
 - 默认密    码：Kuboard123
 
+![image-20240703085133165](https://github.com/user-attachments/assets/f9d3ad39-666e-454d-98bf-e0f39feef5b2)
 
+![image-20240703085200291](https://github.com/user-attachments/assets/2e5e7299-3f9b-4b38-8b62-13431534ba61)
 
 
 
 ### 3.3、操作集群
 
 - 如果你是第一次登录的话，下面的页面中你可能不是已准备，根据提示在master节点上进行操作即可（很简单）
+![image-20240703085322568](https://github.com/user-attachments/assets/57a710f2-9a8e-4b20-9b97-2e5ceb5cc287)
 
 
 
+![image-20240703085514608](https://github.com/user-attachments/assets/b44f3ede-7487-4863-b1a9-03f526355c95)
 
+![image-20240703085623808](https://github.com/user-attachments/assets/ae28d184-d243-47ae-a665-633a3f6846f3)
 
 
 
@@ -505,19 +510,26 @@ kuboard-v3   NodePort   10.100.37.106   <none>        80:30080/TCP,10081:30081/T
 - 以下是一个创建Deployment的流程
 
 
+![image-20240703085752100](https://github.com/user-attachments/assets/3ebaaf39-58c5-458b-bb3a-e853309f53ca)
+
+
+![image-20240703085814856](https://github.com/user-attachments/assets/fae8ea63-9efe-4dda-85c0-ede46f058c5a)
+
+![image-20240703085852804](https://github.com/user-attachments/assets/1475871d-457a-45bb-832a-64a38690bf89)
+
+![image-20240703090052602](https://github.com/user-attachments/assets/57e4c77a-5831-42c8-bbbf-9aca17975c52)
+
+![image-20240703090246189](https://github.com/user-attachments/assets/58dca0db-ea93-47ae-8eb3-3c2c40172e37)
 
 
 
-
-
-
-
-
+![image-20240703090312794](https://github.com/user-attachments/assets/438cb08e-27ff-4c05-8f72-5cbdab95a58d)
 
 
 
 - 需要等待一会再能运行起来Pod，因为需要拉取镜像等一些操作
 
+![image-20240703090434497](https://github.com/user-attachments/assets/ec52cf2e-bdf9-41a2-a8fd-f1e0e912a7d9)
 
 
 ```bash
