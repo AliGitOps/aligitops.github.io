@@ -1,0 +1,544 @@
+---
+layout:       post
+title:        "Kubernetes深入理解Pod"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# 深入理解Pod
+
+[TOC]
+
+## 一、介绍Pod
+
+### 1.1、什么是Pod
+
+- Pod是kubernetes中的最小调度单元，k8s是通过定义一个Pod的资源，然后在Pod里面运行容器，容器需要指定一个镜像，这样就可以用来运行具体的服务。一个Pod封装一个容器（也可以封装多个容器），Pod里的容器共享存储、网络等。也就是说，应该把整个Pod看作虚拟机，然后每个容器相当于运行在虚拟机的进程。
+
+![image-20240623160334654](https://github.com/user-attachments/assets/77a3e018-6e29-4435-b0cc-d5fad79600c7)
+
+
+- Pod是需要调度到k8s集群的工作节点来运行的，具体调度到哪个节点，是根据scheduler调度器实现的。
+
+![image-20240623160425934](https://github.com/user-attachments/assets/482d61ab-5daf-4aa9-8c87-2518fb1887fd)
+
+
+- Pod中可以同时运行多个容器。同一个Pod中的容器会自动的分配到同一个node上。同一个Pod中的容器共享资源、网络环境，它们总是被同时调度，在一个Pod中同时运行多个容器是一种比较高级的用法，只有当你的容器需要紧密配合协作的时候才考虑用这种模式。
+
+### 1.2、Pod的特点
+
+- 容器共享网络命名空间：Pod中的容器共享相同的IP地址和端口范围，可以通过localhost相互通信。
+- 存储卷共享：Pod中的容器可以访问相同的存储卷，方便数据共享和通信。
+- 逻辑单元：Pod提供了一个逻辑独立、机密耦合的单元，容器在同一个Pod中可以方便进行通信和数据共享
+- 生命周期：Pod有自己的生命周期，当Pod中的所有容器都终止时，Pod才会终止
+
+### 1.3、Pod的用途
+
+- 应用组合：将相互关联的应用容器组合到一个Pod中，以便它们可以直接通信。
+
+- 共享存储：多个容器可以访问相同的存储卷，实现数据共享
+- 单元部署：Pod作为一个单元进行部署，确保相关容器共同运行和调度。
+- 微服务：将微服务架构中的一组相关服务打包在一个Pod中，以简化部署和管理
+
+### 1.4、Pod网络
+
+- Pod是有IP地址的，每个Pod都被分配唯一的IP地址（IP地址是靠网络插件calico、flannel、weave等分配的），Pod中的容器共享网络命名空间，包括IP地址和网络端口。Pod内部的容器可以使用localhost相互通信。Pod中的容器也可以通过网络插件calico与其他节点的Pod通信。
+
+### 1.5、Pod存储
+
+- 创建Pod的时候可以指定挂载的存储卷。Pod中的所有容器都可以访问共享卷，允许这些容器共享数据。Pod只要挂载持久化数据卷，Pod重启之后数据还是会存在的。
+
+### 1.6、Pod的工作方式
+
+- Pod的工作方式分为两种，一种是自主式Pod，一种是控制器管理的Pod，所谓的自主式Pod就是直接定义一个Pod资源，这种Pod一旦异常就推出了，使用控制器管理的Pod可以确保Pod始终维持在指定的副本数量。常见的管理Pod的控制器有：Replicaset、Deployment、Job、CronJob、Daemonset、Statefulset
+
+## 二、创建Pod
+
+### 2.1、命令行创建Pod
+
+```bash
+# 使用nginx镜像，创建一个叫nginx-test的Pod，使用--port指定容器内部应用程序监听的端口为80
+[root@k8s-master ~]# kubectl run nginx-test --image=nginx --port=80
+pod/nginx-test created
+
+
+# 查看默认命名空间defalut中的所有Pod
+[root@k8s-master ~]# kubectl get pod
+NAME         READY   STATUS    RESTARTS   AGE
+nginx-test   1/1     Running   0          42s
+
+
+# 使用-o wide可以可以查看到Pod更详细的信息，比如IP地址，Pod被分配所在的节点
+[root@k8s-master ~]# kubectl get pod -o wide
+NAME         READY   STATUS    RESTARTS   AGE    IP              NODE         NOMINATED NODE   READINESS GATES
+nginx-test   1/1     Running   0          107s   10.244.58.195   k8s-node02   <none>           <none>
+
+
+# 使用--show-labels选项可以看到pod的标签
+# LABELS字段为标签
+# pod就是通过标签与service进行关联的
+[root@k8s-master ~]# kubectl get pod --show-labels
+NAME         READY   STATUS    RESTARTS   AGE     LABELS
+nginx-test   1/1     Running   0          2m55s   run=nginx-test
+
+
+# 使用-l选项后面跟标签，可以查询带有指定标签的pod
+[root@k8s-master ~]# kubectl get pod -l run=nginx-test
+NAME         READY   STATUS    RESTARTS   AGE
+nginx-test   1/1     Running   0          5m15s
+
+
+# 删除标签
+
+
+
+# 查看Pod日志
+# 不指定命令空间默认在default下查看pod日志
+[root@k8s-master ~]# kubectl logs nginx-test
+
+
+# 进入Pod容器（如果一个pod中有多个容器，默认会进入第一个容器内，除非指定容器）
+[root@k8s-master ~]# kubectl exec -it nginx-test -- bash
+
+
+# 删除一个叫nginx-test的pod
+[root@k8s-master ~]# kubectl delete pod nginx-test
+pod "nginx-test" deleted
+
+
+# 使用-n选项可以查询指定命名空间的Pod
+# 查看kube-system命名空间中的所有Pod
+[root@k8s-master ~]# kubectl get pod -n kube-system
+
+
+# 使用--all-namespaces可以查询所有命名空间的Pod
+# --all-namespaces也可以简写为-A
+[root@k8s-master ~]# kubectl get pod -A
+NAMESPACE     NAME                                      READY   STATUS    RESTARTS   AGE
+kube-system   calico-kube-controllers-858fbfbc9-l8tpp   1/1     Running   1          4d7h
+kube-system   calico-node-k6qbl                         1/1     Running   1          4d7h
+kube-system   calico-node-q969p                         1/1     Running   1          4d7h
+kube-system   calico-node-sv48g                         1/1     Running   1          4d7h
+kube-system   coredns-7ff77c879f-lnl72                  1/1     Running   1          4d7h
+kube-system   coredns-7ff77c879f-nfx7g                  1/1     Running   1          4d7h
+kube-system   etcd-k8s-master                           1/1     Running   1          4d7h
+kube-system   kube-apiserver-k8s-master                 1/1     Running   1          4d7h
+kube-system   kube-controller-manager-k8s-master        1/1     Running   1          4d7h
+kube-system   kube-proxy-2c282                          1/1     Running   1          4d7h
+kube-system   kube-proxy-6n6pn                          1/1     Running   1          4d7h
+kube-system   kube-proxy-zhm2m                          1/1     Running   1          4d7h
+kube-system   kube-scheduler-k8s-master                 1/1     Running   1          4d7h
+```
+
+### 2.2、资源清单创建Pod
+
+- 在kubernetes中大多数都是使用资源清单来进行创建，通常情况下是yaml格式的。以下是一个创建Pod的yaml示例
+
+```bash
+[root@k8s-master ~]# cat nginx_pod.yaml 
+# 定义Kubernetes API版本
+apiVersion: v1
+
+# 指定Kubernetes资源类型(本次为pod)
+kind: Pod
+
+# Pod的元数据，包括名称、命名空间和标签
+metadata:
+  name: nginx      # Pod的名字为nginx
+  namespace: default   # 在default命名空间中创建这个Pod
+  labels: 
+    app: nginx   # 标签应用为nginx的标签
+
+# Pod的规格，包括容器及配置
+spec:
+  restartPolicy: Never   # 设置重启策略
+  # Pod中的容器列表
+  containers:
+  - name: nginx   # 容器名称
+    ports: 
+    - containerPort: 80  # 从容器中暴露的端口
+    image: nginx:latest   # 用于容器的Docker镜像
+    imagePullPolicy: IfNotPresent   # 容器镜像拉取策略
+```
+
+#### 2.2.1、镜像拉取策略
+
+Kubernetes中的容器镜像拉取策略（imagePullPolicy）有以下三种：
+
+- **Always（总是）**
+
+表示Kubernetes将始终尝试从指定的镜像仓库拉取容器镜像。即使节点上已经存在相同版本的镜像，也会尝试拉取最新的版本。
+
+- **IfNotPresent（如果不存在则拉取）**
+
+这是默认的策略，它表示如果节点上不存在指定的容器镜像版本，那么就拉取该镜像。如果本地已经存在，则不再拉取。
+
+- **Never（从不拉取）**
+
+表示Kubernetes不会尝试拉取指定的容器镜像。他要求节点上必须存在所需版本的镜像，否则启动容器会失败
+
+如果省略imagePullPolicy字段，镜像的名称没有带标签，或是标签是:latest则策略为Always，否则为IfNotPresent。
+
+#### 2.2.2、Pod重启策略
+
+- Pod重启策略有以下3种，Pod的重启策略定义了在容器退出时Kubernetes应该采取的操作。这对于确保应用程序的高可用性非常重要，使用restartPolicy字段进行配置
+
+**Always**：在任何情况下，只要容器不在运行状态，就自动重启容器（默认策略）
+
+**OnFailure**：只在容器异常才自动重启容器
+
+**Never**：从来不重启容器
+
+#### 2.2.3、部署资源
+
+```bash
+[root@k8s-master ~]# kubectl apply -f nginx_pod.yaml 
+pod/nginx created
+[root@k8s-master ~]# kubectl get pod
+NAME    READY   STATUS    RESTARTS   AGE
+nginx   1/1     Running   0          5s
+```
+
+#### 2.2.4、删除资源
+
+```bash
+[root@k8s-master ~]# kubectl delete pod nginx
+pod "nginx" deleted
+[root@k8s-master ~]# kubectl get pod
+No resources found in default namespace.
+```
+
+## 三、静态Pod
+
+### 3.1、静态Pod的介绍
+
+- 在Kubernetes集群中除了我们经常使用到的普通的Pod外，还有一种特殊的Pod，叫做Static Pod，就是我们说的静态Pod，静态Pod有什么特殊的地方呢？
+
+- 静态Pod直接由特定节点上的kubelet进程来管理，不通过master节点上的apiserver。无法与我们常用的控制器 Deployment或者DaemonSet进行关联，它由kubelet进程自己来监控，当Pod崩溃时重启该Pod，kubelet也无法对它们进行健康检查。静态Pod始终绑定在某一个kubelet，并且始终运行在同一个节点上。kubelet会自动为每个静态Pod在kubernetes的apiserver上创建一个镜像Pod，因此我们可以在apiserver中查询到该Pod，但是不能通过apiserver进行控制（例如不能删除）。
+- 创建静态Pod有两种方式：配置文件和HTTP两种方式，在这里我们主要讲解配置文件创建的方式。
+
+### 3.2、创建镜像Pod
+
+- 配置文件就是放在特定目录下的标准的JSON或YAML格式的Pod定义文件。用于kube --pod-manifest-path=<the directory>来启动kubelet进程，kubelet定期的去扫描这个目录，根据这个目录下出现或消失的YAML/JSON文件来创建或者删除静态Pod。
+
+```bash
+# 写在/etc/kubernetes/manifests/即可
+[root@k8s-master ~]# cat > /etc/kubernetes/manifests/static-nginx.yaml << EOF
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: nginx01
+  namespace: default
+  labels: 
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    ports: 
+    - containerPort: 80
+    image: nginx:latest
+  imagePullPolicy: IfNotPresent
+EOF
+
+[root@k8s-master ~]# kubectl get pod
+NAME                 READY   STATUS    RESTARTS   AGE
+nginx01-k8s-master   1/1     Running   0          53s
+
+
+# 删除pod后pod依然存在
+[root@k8s-master ~]# kubectl delete pod nginx01-k8s-master
+pod "nginx01-k8s-master" deleted
+[root@k8s-master ~]# kubectl get pod
+NAME                 READY   STATUS    RESTARTS   AGE
+nginx01-k8s-master   1/1     Running   0          27s
+
+
+# 只有删除yaml资源文件才能删除
+[root@k8s-master ~]# rm -rf /etc/kubernetes/manifests/static-nginx.yaml 
+[root@k8s-master ~]# kubectl get pod
+No resources found in default namespace.
+```
+
+## 四、Pod Hook
+
+### 4.1、Pod Hook介绍
+
+​	我们都知道Pod是Kubernetes群集中的最小单元，而Pod是有容器组成的，所以在谈论Pod的生命周期的时候我们可以先来讨论下容器的生命周期。
+
+实际上Kubernetes为我们的容器提供了生命周期钩子，就是我们说的Pod Hook，Pod Hook是由kubelet发起的，当容器中的进程启动前或者容器中的进程终止之前运行，这是包含在容器的生命周期之中。我们可以同时为Pod中的所有容器都配置Hook。
+
+
+
+Kubernetes为我们提供了两种钩子函数：
+
+- PostStart：这个钩子在容器创建后立即执行。但是，并不能保证钩子将在容器ENTRYPOIN之前运行，因为没有参数传递给处理程序。主要用于资源部署、环境准备等。不过需要注意的是如果钩子花费太长时间以至于不能运行或者挂起，容器将不能达到running状态。
+- PreStop：这个钩子在容器终止之前立即被调用。它是阻塞的，意味着它是同步的，所以它必须在删除容器的调用发出之前完成。主要用于优化关闭应用程序、通知其他系统等。如果钩子在执行期间挂起，Pod阶段将停留在running状态且永不会达到failed状态
+
+
+
+​		如果PostStart或者PreStop钩子失败，它会杀死容器。所以我们应该让钩子函数尽可能的轻量。当然有些情况下，长时间运行命令是合理的，比如在停止容器之前预先保存状态。
+
+
+
+​		另外我们有两种方式来实现上面的钩子函数：
+
+**Exec**：用于执行一段特定的命令，不过要注意的是该命令消耗的资源会被计入容器
+
+**HTTP**：对容器上的特定的端点执行HTTP请求
+
+### 4.2、Pod Hook的时候
+
+- 以下是一个示例
+
+```bash
+[root@k8s-master ~]# cat nginx_hook.yaml 
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: nginx02
+  labels:
+    app: nginx
+spec:
+  restartPolicy: Always
+  containers:
+  - name: test-nginx01
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    ports:
+    - containerPort: 80
+    lifecycle:
+      postStart: 
+        exec: 
+          # 启动容器立即执行的命令
+          command: ["sh","-c","echo 'postart' >> /start.txt"]
+      preStop:
+        exec:
+          # 关闭容器立即执行的命令
+          command: ["sh","-c","echo 'prestop' >> /stop.html; sleep 100"]
+
+```
+
+```bash
+[root@k8s-master ~]# kubectl apply -f nginx_hook.yaml 
+pod/nginx02 created
+[root@k8s-master ~]# kubectl get pod nginx02
+NAME      READY   STATUS    RESTARTS   AGE
+nginx02   1/1     Running   0          27s
+```
+
+```bash
+# 进入容器可以发现我们定义的postStart被执行了
+[root@k8s-master ~]# kubectl exec -it nginx02 -- bash
+root@nginx02:/# cat /start.txt 
+postart
+```
+
+```bash
+# 删除Pod，然后迅速的去打开一个终端进行验证，容器被关闭的时候是否执行了相应的命令
+[root@k8s-master ~]# kubectl delete pod nginx02
+pod "nginx02" deleted
+
+
+# 在打开一个终端，发现删除pod的时候定义的preStop被执行了
+[root@k8s-master ~]# kubectl exec -it nginx02 -- bash
+root@nginx02:/# cat /stop.html 
+prestop
+```
+
+## 五、Pod健康检查
+
+在kubernetes集群当中，我们可以通过配置liveness probe（存活探针）和readiness probe（可读性探针）来影响容器的生存周期。
+
+**目前LivenessProbe和ReadinessProbe两种探针都支持下面三种探测方式：**
+
+- ExecAction：在容器中执行指定的命令，如果执行成功，退出代码为0则探测成功
+- TCPSocketAction：通过容器的IP地址和端口号执行TCP检查，如果能够简历TCP连接，则表明容器健康。
+- HTTPGetAction：通过容器的IP地址、端口号及路径调用HTTP Get方法，如果相应的状态码大于等于200且小于400，则认为容器健康
+
+**探针探测结果有以下值：**
+
+- Success：表示通过检测
+- Failure：表示未通过检测
+- Unknown：表示检测没有正常运行
+
+Pod探针相关的属性：探针（Probe）有许多可选字段，可以用来更加精确的控制Liveness和Readiness两种探针的行为
+
+- initialDelaySeconds：Pod启动后首次进行检查的等待时间，单位“秒”
+- periodSeconds：检查的间隔时间，默认为10s，单位“秒”
+- timeoutSeconds：探针执行检测请求后，等待相应的超时时间，默认为1s，单位“秒”
+- successThreshold：连续失败的重试次数，重试一定次数后将认为失败，在热爱的iness探针中，Pod会被标记为未就绪，默认为3，最小值为1
+
+### 5.1、livenessProbe：存活性探测
+
+- 许多应用程序经过长时间运行，最终过渡到无法运行的状态，除了重启，无法恢复。通常情况下，K8S会发现应用程序已经终止，然后重启应用程序Pod。有时应用程序可能因为某些原因（后端服务故障等）导致暂时无法对外提供服务，但应用软件没有终止，导致K8S无法隔离有故障的Pod，调用者可能会访问到有故障的Pod，导致业务不稳定。K8S提供livenessProbe来检测容器是否正常运行，并且对相应情况进行相应的补救措施。
+
+```bash
+# 该资源清单定义了livenessProbe，启动后10秒在进行检查，每3秒检测一次
+# 检测失败就会重启Pod
+[root@master ~]# cat nginx_livenessProbe.yaml 
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  restartPolicy: Always
+  containers:
+  - name: test-nginx
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    # 容器内指定的命令
+    args:
+    - /bin/sh
+    - -c
+    # 创建一个文件等待30秒后删除，然后等待600秒（十分钟）
+    - touch /tmp/healthy;sleep 30;rm -rf /tmp/healthy;sleep 600
+    # 存活性探测
+    livenessProbe:
+    # 启动容器后等待10秒
+      initialDelaySeconds: 10
+    # 每3秒进行一次探测
+      periodSeconds: 3
+     # 执行的命令
+      exec: 
+        command: 
+        - cat
+        - /tmp/healthy
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_livenessProbe.yaml 
+pod/nginx created
+
+
+# 检测失败就会重启Pod，可以查看RESTARTl了解重启次数
+[root@master ~]# kubectl get pod
+NAME    READY   STATUS    RESTARTS      AGE
+nginx   1/1     Running   5 (28s ago)   6m37s
+```
+
+### 5.2、readinessProbe：就绪性探测
+
+- 在没有配置readinessProbe的资源对象中，pod中的容器启动完成后，就认为pod中的应用程序可以对外提供服务，该pod就会加入相应的service，对外提供服务。但有时一些应用程序启动后，需要较长时间的加载才能对外服务，如果这时对外提供服务，执行结果必然无法达到预期的效果，影响用户体验。比如使用tomcat应用程序来说，并不是简单地说tomcat启动成功就可以对外提供服务的，还需要等待spring容器初始化，数据库连接上等等
+
+```bash
+# 该资源定义了readinessProbe，启动后20秒在进行检查
+# 每隔5秒检测一次80端口的/index.heml页面，设置10秒超时，检测失败，该pod就不能提供服务
+[root@master ~]# cat nginx_readinessProbe.yaml 
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: nginx01
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    ports:
+    # 指定80端口命令
+    - name: server
+      containerPort: 80
+    # 指定81端口名称
+    - name: management
+      containerPort: 81
+    # 可读性探针探测
+    readinessProbe:
+    # 启动后等待20秒
+      initialDelaySeconds: 20 
+    # 每间隔5秒进行一次探测
+      periodSeconds: 5
+    # 执行探测请求后，等待响应的超时时间
+      timeoutSeconds: 10
+    # 向80端口发送HTTP访问请求
+      httpGet:
+        scheme: HTTP
+        port: 80
+        path: /index.html
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_readinessProbe.yaml 
+pod/nginx01 created
+
+
+# 把pod的index.heml页面删除发现pod的就绪状态就变了
+# 就绪的字段为“READY”如果为0表示未就绪
+[root@master ~]# kubectl exec -it nginx01 -- rm -rf /usr/share/nginx/html/index.heml
+[root@master ~]# kubectl get pod nginx01
+NAME      READY   STATUS    RESTARTS   AGE
+nginx01   0/1     Running   0          5m1s
+```
+
+### 5.3、两种探针的区别
+
+ReadinessProbe和livenessProbe可以使用相同的探测方式，只是对Pod的处置方式不同：
+
+- readinessProbe：当检测失败后，将pod的IP:Port从对应的EngPoint列表中删除。
+- livenessProbe：当检测失败后，将杀死容器并根据Pod的重启策略决定做出对应的措施
+
+## 六、初始化容器
+
+- Pod里面可以有一个或者多个容器，部署应用的容器可以称为主容器，在创建Pod时候，Pod中可以有一个或多个先于主容器启动init容器，这个init容器就可以成为初始化容器，初始化容器一旦执行完，它从启动开始到初始代码执行完就退出了，它不会一直存在，所以在主容器启动之前执行初始化，初始化容器可以有多个，多个初始化是要串行执行的，先执行初始化容器1，再执行初始化容器2等，等初始化容器执行完初始化就推出了，然后再执行主容器，主容器一退出，pod就结束了，主容器退出的时间就是pod的结束点，他俩时间轴是一致的。
+- init容器就是做初始化工作的容器。可以有一个或多个，如果多个按照定义的顺序依次执行，只有所有的初始化容器执行完后，主容器才能启动。由于一个Pod里的存储卷是共享的，所以init Container里产生的数据可以被主容器使用到，init Container可以在多种K8S资源里被使用到，如Deployment、DaemonSet、StatefulSet、Job等，但都是在Pod启动时，在主容器启动前指定，做初始化工作。
+
+**init容器与普通的容器区别是：**
+
+- init容器不支持Readiness，因为它们必须在pod就绪之前运行完成。
+- 每个init容器必须运行成功，下一个才能运行。
+- 如果Pod的init容器失败，Kubernetes会不断地重启该Pod，直到init容器成功为止，然而，如果Pod对应的restartPolicy值为Never，它不会重启启动。
+
+```bash
+[root@master ~]# cat nginx_init.yaml 
+apiVersion: "v1"
+kind: Pod
+metadata:
+  name: nginx02
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: test-nginx
+    ports:
+    - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+    - name: webdata
+      mountPath: /usr/share/nginx/html
+  initContainers:
+  - name: init-heml
+    image: busybox:1.28
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+    - name: webdata
+      mountPath: /opt
+    command: ["sh","-c","echo 'init' > /opt/index.html"]
+  volumes:
+  - name: webdata
+    emptyDir: {}
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx_init.yaml 
+pod/nginx02 created
+ 
+ 
+# 启动的时候先启动初始化启动
+[root@master ~]# kubectl get pod
+nginx02   0/1     Init:0/1           0                5s
+[root@master ~]# kubectl get pod
+nginx02   1/1     Running   0                65s
+
+
+# 查看容器里面index.html文件的内容就是初始化容器写的
+[root@master ~]# kubectl exec -it nginx02 -c test-nginx -- cat /usr/share/nginx/html/index.html
+init
+
+```
+
