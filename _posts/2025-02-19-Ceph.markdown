@@ -1,0 +1,968 @@
+# Kubernetes对接Ceph存储
+
+[TOC]
+
+## 一、什么是Ceph
+
+### 1.1、Ceph简介
+
+- Ceph是一个传统的分布式存储系统，设计初衷是提供较好的性能、可靠性和可扩展性。
+- Seph项目最早起源于Sage就读博士期间的工作（最早的成功与2004年发表），并随后贡献给开源社区。在经过了数年的发展之后，目前已得到众多云计算厂商的支持并被广泛应用。RehHat及OpenStack都可与Ceph整合以支持虚拟机镜像的后端存储。
+
+### 1.2、Ceph特点
+
+- 高性能
+  - 摒弃了传统的集中式存储元素据寻址的方案，采用CRUSH算法，数据分布均衡，并行度高。
+  - 考虑了容灾域的隔离，能够实现各类负载副本放置规则，例如跨机房、机架感知等
+  - 能够支持上千个存储节点的规模，支持TB到PB级的数据。
+- 高可用性
+  - 副本数可以灵活控制
+  - 支持故障域隔离，数据强一致性
+  - 多种故障场景自动进行修复自愈
+  - 没有单点故障，自动管理
+- 可扩展性
+  - 去中心化
+  - 扩展灵活
+  - 随着节点增加而线性增长
+- 特性丰富
+  - 支持三种存储接口：块存储、文件存储、对象存储
+  - 支持自定义接口，支持多种语言驱动
+
+## 二、部署Ceph
+
+### 2.1、Rook介绍
+
+- Rook是一款云原生存储编排服务工具，Ceph是一种广泛使用的开源分布式存储方案，通过Rook可以大大简化Ceph在Kubernetes集群中的部署和维护工作。
+- Rook由云原生基金会（CNCF）孵化，且于2020年10月正式进入毕业阶段。Rook并不直接提供数据存储方案，而是集成了各种存储解决方案，并提供了一种自管理、自扩容、自修复的云原生存储服务。社区管理资料显示，Rook目前最新的稳定版本中，只有Rook + Ceph存储集成方案处于stable（稳定的）状态，版本升级较平滑。
+- Ceph是一种广泛使用的开源存储方案，通过Rook则可以大大简化Ceph在Kubernetes集群中的部署和维护工作。基于Rook + Ceph的存储方案，能为云原生环境提供文件、块及对象存储服务。
+- 建立Ceph集群不仅需要大量的服务器资源，本身的复杂度也需要人力成本。但是在企业内使用Kubernetes时，无论是在部署业务服务还是中间件服务，都能很明显地体会到Kubernetes的便利性和强大之处，所以我们在企业内部使用Kubernetes时，同时也会把中间件服务（比如MysQL、RabbitMQ、Zookeeper等）部署在Kubernetes集群中。相对于生产环境，也需要保留它们的数据，但是非生产环境可能并没有现成的，存储平台供Kubernetes使用，新建一个平台供其使用也会浪费很多精力。为了解决非生产环境的数据持久化问题，很多公司都采用了NFS作为后端，但是一旦使用的容器较多或者存储的数据量比较大，就容器造成性能问题，并且NFS服务器一旦出问题，整个数据可能会全部丢失，所以在非生产环境也需要一个高可用、分布式并且免运维的存储平台，于是Rook就诞生了。Rook是一个自我管理的分布式存储编排系统，它本身并不是存储系统，Rook在存储和Kubernetes之间搭建了一个桥梁，使存储系统的搭建或者维护变得特别简单，Rook将分布式存储转变为自我管理、自我扩展、自我修复的存储服务，它让一些存储操作比如部署、配置、扩容、升级、灾难恢复、监视和资源管理变得自动化，无须人工处理，同时Rook支持CSI，可以利用CSI做一些PVC的快照、扩容、克隆等操作。
+
+- 有了Rook就可以快速搭建一个Ceph存储系统，用来持久化一些必需的数据，不仅降低了运维复杂度，也能更加方便地体验Kubernetes带来的收益，同时也可以通过Rook来演示更多的Kubernetes存储的高级功能。
+
+### 2.2、调整集群环境
+
+#### 2.2.1、添加磁盘
+
+- **注意：在本案例中，是一台master，两台node，因为ceph集群的最小要求是三个节点，因此需要在包含master主机在内的三台主机都添加磁盘。所有主机添加一块100G的磁盘，以满足案例实验需求。**
+
+- 数据盘可以是一块硬盘sdb，也可以是硬盘的一个分区sdb2，或者逻辑卷，但是这些都必须没有被格式化过，没有指定文件系统类型。
+- 可以使用lsblk -f 来确认数据盘有没有被文件系统格式化过。FSTYPE字段为空即代表未被文件系统格式化过。
+
+#### 2.2.2、安装lvm2
+
+- Ceph OSD 在某些情况下（比如启用加密或指定元数据设备）依赖于LVM。如果没有安装LVM2软件包，则虽然Rook可以成功创建 Ceph OSD但是节点重新启动时，重新启动的节点上运行的OSD pod将无法启动。
+
+```bash
+# 所有节点安装lvm2
+yum -y install lvm2
+```
+
+#### 2.2.3、加载rbd内核
+
+- Ceph存储需要包含了RBD模块的linux内核来支持。在Kubernetes环境中运行Ceph存储之前，需要在Kubernetes节点运行modprobe rbd命令来测试当前内核中是否已经加载了RBD内核。
+
+```bash
+# 所有节点都要执行
+modprobe rbd
+lsmod | grep rbd
+```
+
+#### 2.2.4、取消污点
+
+- 由于ceph集群默认最小三个节点，当前Kubernetes也是三个节点，1个master+2个worker，所以需要使用master节点来充当ceph节点，因此需要取消master节点上的污点，否则ceph相关pod无法调度到master节点，导致部署失败。
+- 当然，如果woker节点足够满足无需此操作。
+
+```bash
+# master节点上执行即可
+# 此命令能够取消所有设备的污点
+[root@master ~]# kubectl taint node --all node-role.kubernetes.io/master-
+node/master untainted
+taint "node-role.kubernetes.io/master" not found
+taint "node-role.kubernetes.io/master" not found
+```
+
+#### 2.2.5、加载镜像
+
+- 所有Kubernetes节点都要加载镜像。
+
+```bash
+docker load < rook-ceph-v1.11.5-images.tar.gz 
+docker load < mysql-5.6.tar.gz 
+docker load < nginx-1.20.tar.gz 
+docker load < registry-2.tar.gz
+docker load < snapshot-controller-v3.0.0.tar.gz 
+```
+
+### 2.3、部署Rook operator
+
+- 本次部署的版本是 v1.11.5
+
+```bash
+[root@master ~]# yum -y install git
+[root@master ~]# git clone --single-branch --branch v1.11.5 https://github.com/rook/rook.git
+```
+
+```bash
+[root@master ~]# cd /root/rook/deploy/examples/
+[root@master examples]# kubectl apply -f crds.yaml -f common.yaml -f operator.yaml
+```
+
+```bash
+[root@master examples]# kubectl get pod -n rook-ceph 
+NAME                                  READY   STATUS    RESTARTS   AGE
+rook-ceph-operator-795c57bb67-smwbg   1/1     Running   0          2s
+```
+
+### 2.4、部署Ceph集群
+
+```bash
+[root@master examples]# kubectl apply -f cluster.yaml
+```
+
+```bash
+# 注意READY字段的数字，要全部都准备好
+[root@master examples]# kubectl -n rook-ceph get pod
+NAME                                            READY   STATUS    RESTARTS   AGE
+csi-cephfsplugin-fjq4s                          2/2     Running   0          30s
+csi-cephfsplugin-p78xd                          2/2     Running   0          30s
+csi-cephfsplugin-provisioner-6f5d88b7ff-68nwd   5/5     Running   0          30s
+csi-cephfsplugin-provisioner-6f5d88b7ff-bn89n   5/5     Running   0          30s
+csi-cephfsplugin-sztpt                          2/2     Running   0          30s
+csi-rbdplugin-8gx4t                             2/2     Running   0          31s
+csi-rbdplugin-8wzrr                             2/2     Running   0          31s
+csi-rbdplugin-kbnbc                             2/2     Running   0          31s
+csi-rbdplugin-provisioner-57f5ddbd7-4n4qk       5/5     Running   0          31s
+csi-rbdplugin-provisioner-57f5ddbd7-zk9s4       5/5     Running   0          31s
+rook-ceph-mon-a-5bd5fc7d75-6jjtt                2/2     Running   0          23s
+rook-ceph-operator-6c54c49f5f-v28zd             1/1     Running   0          51s
+```
+
+### 2.5、部署ceph-tools
+
+```bash
+[root@master examples]# kubectl apply -f toolbox.yaml
+```
+
+```bash
+[root@master examples]# kubectl get pod -n rook-ceph 
+NAME                                               READY   STATUS      RESTARTS   AGE
+csi-cephfsplugin-fjq4s                             2/2     Running     0          2m26s
+csi-cephfsplugin-p78xd                             2/2     Running     0          2m26s
+csi-cephfsplugin-provisioner-6f5d88b7ff-68nwd      5/5     Running     0          2m26s
+csi-cephfsplugin-provisioner-6f5d88b7ff-bn89n      5/5     Running     0          2m26s
+csi-cephfsplugin-sztpt                             2/2     Running     0          2m26s
+csi-rbdplugin-8gx4t                                2/2     Running     0          2m27s
+csi-rbdplugin-8wzrr                                2/2     Running     0          2m27s
+csi-rbdplugin-kbnbc                                2/2     Running     0          2m27s
+csi-rbdplugin-provisioner-57f5ddbd7-4n4qk          5/5     Running     0          2m27s
+csi-rbdplugin-provisioner-57f5ddbd7-zk9s4          5/5     Running     0          2m27s
+rook-ceph-crashcollector-master-86cd877564-c9vd6   1/1     Running     0          78s
+rook-ceph-crashcollector-node1-55f95c7755-7cfnp    1/1     Running     0          96s
+rook-ceph-crashcollector-node2-64964c9cd4-ltgl4    1/1     Running     0          67s
+rook-ceph-mgr-a-7775f464c9-8lb5l                   3/3     Running     0          96s
+rook-ceph-mgr-b-6694646456-77rnf                   3/3     Running     0          96s
+rook-ceph-mon-a-5bd5fc7d75-6jjtt                   2/2     Running     0          2m19s
+rook-ceph-mon-b-7764f7474f-7hl9m                   2/2     Running     0          116s
+rook-ceph-mon-c-7cd4d68749-q2dxb                   2/2     Running     0          106s
+rook-ceph-operator-6c54c49f5f-v28zd                1/1     Running     0          2m47s
+rook-ceph-osd-0-7f5c89c-kq7lq                      2/2     Running     0          68s
+rook-ceph-osd-1-8665d558bc-sz9kl                   2/2     Running     0          67s
+rook-ceph-osd-prepare-master-5x5dk                 0/1     Completed   0          45s
+rook-ceph-osd-prepare-node1-pd28h                  0/1     Completed   0          42s
+rook-ceph-osd-prepare-node2-x4krz                  0/1     Completed   0          38s
+########################################################
+rook-ceph-tools-598b59df89-tbxwl                   1/1     Running     0          53s
+########################################################
+```
+
+### 2.6、登录 rook-ceph-tools
+
+```bash
+# 进入2.5查看到的tools pod进入
+[root@master examples]# kubectl exec -it -n rook-ceph rook-ceph-tools-598b59df89-tbxwl -- bash
+```
+
+#### 2.6.1、查看ceph集群状态
+
+```bash
+bash-4.4$ ceph -s
+  cluster:
+    id:     1e8dbb06-e9bf-466f-b71c-ed59a56cbefe
+    health: HEALTH_OK
+ 
+  services:
+    mon: 3 daemons, quorum a,b,c (age 111s)
+    mgr: b(active, since 33s), standbys: a
+    osd: 3 osds: 3 up (since 66s), 3 in (since 82s)
+ 
+  data:
+    pools:   1 pools, 1 pgs
+    objects: 2 objects, 449 KiB
+    usage:   62 MiB used, 300 GiB / 300 GiB avail
+    pgs:     1 active+clean
+```
+
+#### 2.6.2、查看 osd 目录树
+
+```bash
+bash-4.4$ ceph osd tree
+ID  CLASS  WEIGHT   TYPE NAME        STATUS  REWEIGHT  PRI-AFF
+-1         0.29306  root default                              
+-3         0.09769      host master                           
+ 0    hdd  0.09769          osd.0        up   1.00000  1.00000
+-7         0.09769      host node1                            
+ 2    hdd  0.09769          osd.2        up   1.00000  1.00000
+-5         0.09769      host node2                            
+ 1    hdd  0.09769          osd.1        up   1.00000  1.00000
+```
+
+#### 2.6.3、查看 osd 存储状态
+
+```bash
+bash-4.4$ ceph osd status
+ID  HOST     USED  AVAIL  WR OPS  WR DATA  RD OPS  RD DATA  STATE      
+ 0  master  20.6M  99.9G      0        0       0        0   exists,up  
+ 1  node2   20.6M  99.9G      0        0       0        0   exists,up  
+ 2  node1   20.6M  99.9G      0        0       0        0   exists,up  
+```
+
+#### 2.6.4、列出 osd 存储池
+
+```bash
+bash-4.4$ ceph osd pool ls
+.mgr
+```
+
+### 2.7、部署 ceph-dashboard
+
+#### 2.7.1、部署 dashboard
+
+```bash
+[root@master examples]# pwd
+/root/rook/deploy/examples
+[root@master examples]# kubectl apply -f dashboard-external-https.yaml 
+```
+
+#### 2.7.2、删除原有的svc
+
+```bash
+[root@master examples]# kubectl get svc -n rook-ceph 
+NAME                                     TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)             AGE
+rook-ceph-mgr                            ClusterIP   10.1.8.146     <none>        9283/TCP            5m19s
+########################################################
+rook-ceph-mgr-dashboard                  ClusterIP   10.1.61.4      <none>        8443/TCP            5m19s
+########################################################
+rook-ceph-mgr-dashboard-external-https   NodePort    10.1.20.145    <none>        8443:31017/TCP      27s
+rook-ceph-mon-a                          ClusterIP   10.1.191.124   <none>        6789/TCP,3300/TCP   6m24s
+rook-ceph-mon-b                          ClusterIP   10.1.175.144   <none>        6789/TCP,3300/TCP   5m59s
+rook-ceph-mon-c                          ClusterIP   10.1.69.178    <none>        6789/TCP,3300/TCP   5m48s
+```
+
+```bash
+[root@master examples]# kubectl delete svc -n rook-ceph rook-ceph-mgr-dashboard
+```
+
+```bash
+[root@master examples]# kubectl get svc -n rook-ceph 
+NAME                                     TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)             AGE
+rook-ceph-mgr                            ClusterIP   10.1.8.146     <none>        9283/TCP            6m27s
+rook-ceph-mgr-dashboard                  ClusterIP   10.1.166.141   <none>        8443/TCP            7s
+########################################################
+rook-ceph-mgr-dashboard-external-https   NodePort    10.1.20.145    <none>        8443:31017/TCP      95s
+########################################################
+rook-ceph-mon-a                          ClusterIP   10.1.191.124   <none>        6789/TCP,3300/TCP   7m32s
+rook-ceph-mon-b                          ClusterIP   10.1.175.144   <none>        6789/TCP,3300/TCP   7m7s
+rook-ceph-mon-c                          ClusterIP   10.1.69.178    <none>        6789/TCP,3300/TCP   6m56s
+```
+
+#### 2.7.3、获取 ceph-dashboard 的登录密码
+
+```bash
+[root@master examples]# kubectl -n rook-ceph get secret rook-ceph-dashboard-password -o jsonpath="{['data']['password']}"|base64 --decode && echo
+FaEd5E<((/8<E597V,y+
+
+
+# 账号：admmin
+# 密码：FaEd5E<((/8<E597V,y+（命令查询到的密码为准）
+```
+
+#### 2.7.4、登录ceph-dashboard
+
+- 访问地址：https://192.168.93.101:31017
+
+```bash
+[root@master examples]# kubectl get svc -n rook-ceph 
+NAME                                     TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)             AGE
+rook-ceph-mgr                            ClusterIP   10.1.8.146     <none>        9283/TCP            9m29s
+rook-ceph-mgr-dashboard                  ClusterIP   10.1.166.141   <none>        8443/TCP            3m9s
+########################################################
+rook-ceph-mgr-dashboard-external-https   NodePort    10.1.20.145    <none>        8443:31017/TCP      4m37s
+########################################################
+rook-ceph-mon-a                          ClusterIP   10.1.191.124   <none>        6789/TCP,3300/TCP   10m
+rook-ceph-mon-b                          ClusterIP   10.1.175.144   <none>        6789/TCP,3300/TCP   10m
+rook-ceph-mon-c                          ClusterIP   10.1.69.178    <none>        6789/TCP,3300/TCP   9m58s
+```
+
+![image-20240810095812107](https://github.com/user-attachments/assets/883845ff-e549-4e2e-9835-fea88e1e327a)
+
+
+![image-20240810095829403](https://github.com/user-attachments/assets/34e06d26-e5b8-4026-9ed6-4c80a3713422)
+
+
+![image-20240810095855344](https://github.com/user-attachments/assets/e60b3b21-516e-4782-b89b-52d6cfc12920)
+
+
+![image-20240810095907943](https://github.com/user-attachments/assets/e56f2b09-d148-4d49-8ee0-52b568a76b96)
+
+
+## 三、ceph 块存储使用
+
+- 块存储的使用一般是一个Pod挂载一个块存储，相当于一个服务器新挂载了一个磁盘，只给一个应用使用，比如中间件服务 MySQL、ReabbitMQ、Redis等。
+
+### 3.1、部署StorageClass
+
+- 修改storageclass.yaml文件，然后根据需求修改对应的参数。此处主要修改的是副本数量，在生产环境中，副本数至少为3，且不能超过OSD的数量。此处为实验环境，本案例设置为2.
+- 主要修改spec.replicated.size配置。
+
+```bash
+[root@master rbd]# pwd
+/root/rook/deploy/examples/csi/rbd
+```
+
+```bash
+[root@master rbd]# head storageclass.yaml 
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: replicapool
+  namespace: rook-ceph # namespace:cluster
+spec:
+  failureDomain: host
+  replicated:
+    size: 2  # 修改此处的内容为2
+    # Disallow setting pool with replica 1, this could lead to data loss without recovery.
+```
+
+```bash
+[root@master rbd]# kubectl apply -f storageclass.yaml -n rook-ceph 
+[root@master rbd]# kubectl get cephblockpool -n rook-ceph 
+NAME          PHASE
+replicapool   Ready
+[root@master rbd]# kubectl get sc
+NAME              PROVISIONER                  RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+rook-ceph-block   rook-ceph.rbd.csi.ceph.com   Delete          Immediate           true                   36s
+```
+
+- 注意：这里创建的StorageClass的名字为rook-ceph-block，在创建PVC的时候执行这个名字，即可让PVC和这个存储关联起来。
+
+- 通过Ceph Dashboard查看
+
+![image-20240810100623096](https://github.com/user-attachments/assets/58c44289-436c-44c1-9ff0-f5285b8e0495)
+
+
+### 3.2、部署应用使用存储
+
+#### 3.2.1、部署应用
+
+- 在这个文件中有一段PVC的配置，该PVC会连接刚才创建的StorageClass，然后动态创建PV供Pod使用，之后如果有其他的存储需求，只需要创建PVC指定storageClassName为刚才创建的StorageClass名称即可连接到Rook的Ceph。如果是statefulSet，只需要将volumeTemolateClaim里面的Clami名称改为StorageClass名称即可动态地为每个Pod创建一个单独的PV。
+
+```bash
+[root@master examples]# pwd
+/root/rook/deploy/examples
+```
+
+```bash
+[root@master examples]# kubectl apply -f mysql.yaml
+[root@master examples]# kubectl get pod
+NAME                               READY   STATUS    RESTARTS   AGE
+wordpress-mysql-79966d6c5b-2tvzk   1/1     Running   0          11s
+```
+
+#### 3.2.2、查看PV、PVC
+
+- 因为MySQL的数据不允许多个MySQL实例连接同一个存储，所以一般只能用块存储。相当于新加了一块盘给MySQL使用。创建完成后可以查看创建的PVC和PV。
+
+```bash
+[root@master examples]# kubectl get pvc
+NAME             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+mysql-pv-claim   Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   20Gi       RWO            rook-ceph-block   108s
+[root@master examples]# kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                    STORAGECLASS      REASON   AGE
+pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   20Gi       RWO            Delete           Bound    default/mysql-pv-claim   rook-ceph-block            108s
+
+```
+
+#### 3.2.3、Ceph Dashboard上查看对应的Image
+
+![image-20240810101347909](https://github.com/user-attachments/assets/3df51c5c-27fb-4e0a-8620-e457d7b9353e)
+
+
+#### 3.2.4、部署StatfulSet类型应用
+
+- 在之前的章节提到过StatfulSet用于有状态的应用部署，在实际使用时，可以很方便地利用StatfulSet创建一个Eureka集群、Redis集群或者其他集群。在使用StatfulSet创建应用时，会给每个Pod创建一个固定的标识符比如redis-0、redis-1等。
+- 根据StatfulSet的特性，可以很方便地组建一个集群，但是需要注意的是，受StatfulSet管理的Pod可能每个Pod都需要自己独立的存储，并非和其他Pod共享数据。比如创建一个Redis一主二从的主从架构，Redis主节点和两个从节点的数据肯定是不一致的，所以此时需要为每个Pod单独创建一个存储供其使用，可以使用StatfulSet独有的volumeClaimTemplates参数结合StorageClass为每个Pod动态创建PVC，这样每个Pod就有了自己独有的存储。接下来一个简单的示例介绍volumeClaimTemplates的使用。
+
+```bash
+[root@master ~]# kubectl apply -f volumeClaimTemplates.yaml
+```
+
+```bash
+[root@master ~]# kubectl get pod -l app=nginx
+NAME    READY   STATUS    RESTARTS   AGE
+web-0   1/1     Running   0          76s
+web-1   1/1     Running   0          58s
+web-2   1/1     Running   0          53s
+```
+
+```bash
+[root@master ~]# kubectl get pvc
+NAME             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+mysql-pv-claim   Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   20Gi       RWO            rook-ceph-block   11m
+www-web-0        Bound    pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            rook-ceph-block   94s
+www-web-1        Bound    pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            rook-ceph-block   76s
+www-web-2        Bound    pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            rook-ceph-block   71s
+```
+
+- 此时，3个Pod分别有了自己的存储数据相互不共享，在使用StatfulSet建立Redis、MySQL、RabbitMQ集群时，如果需要持久化数据，就需要使用volumeClaimTemplates参数为每个Pod提供存储。
+
+## 四、共享型文件系统的使用
+
+- 共享型文件系统一般用于多个Pod共享一个存储，比如用户上传的头像，需要被多个前端访问等。
+
+### 4.1、创建共享型文件系统
+
+- 与块存储类似，也需要创建共享型文件存储的Pod。
+
+```bash
+[root@master examples]# pwd
+/root/rook/deploy/examples
+```
+
+```bash
+[root@master examples]# kubectl apply -f filesystem.yaml
+```
+
+```bash
+[root@master examples]# kubectl get pod -n rook-ceph -l app=rook-ceph-mds
+NAME                                    READY   STATUS    RESTARTS   AGE
+rook-ceph-mds-myfs-a-dd47f5dfc-xkl64    2/2     Running   0          26s
+rook-ceph-mds-myfs-b-77997bddd8-kn5zj   2/2     Running   0          25s
+```
+
+- 在Ceph dashboard查看
+
+![image-20240810102526894](https://github.com/user-attachments/assets/55a8d81e-0006-49b4-9539-afd32495b64b)
+
+
+### 4.2、创建共享型文件系统的StorageClass
+
+```bash
+[root@master examples]# cd /root/rook/deploy/examples/csi/cephfs/
+[root@master cephfs]# kubectl apply -f storageclass.yaml
+```
+
+- 之后将PVC的storageClassName设置成rook-cephfs即可创建共享文件类型的存储（指向块存储的StorageClass即为创建块存储），可以供多个Pod共享数据。
+
+### 4.3、挂载测试
+
+```bash
+[root@master cephfs]# pwd
+/root/rook/deploy/examples/csi/cephfs
+```
+
+```bash
+# 镜像拉取测试改为IfNotPresent
+[root@master cephfs]# kubectl apply -f kube-registry.yaml
+```
+
+```bash
+[root@master cephfs]# kubectl get pod -n kube-system -l k8s-app=kube-registry 
+NAME                            READY   STATUS    RESTARTS   AGE
+kube-registry-c89875cd9-45mxc   1/1     Running   0          31s
+kube-registry-c89875cd9-fqcgc   1/1     Running   0          33s
+kube-registry-c89875cd9-k4g76   1/1     Running   0          30s
+```
+
+```bash
+[root@master cephfs]# kubectl get pvc -n kube-system
+NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+cephfs-pvc   Bound    pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972   1Gi        RWX            rook-cephfs    2m58s
+```
+
+- 此时一共创建了3个Pod，这3个Pod共用一个存储，并都挂载到了/var/lib/registry，该目录中的数据由3个容器共享。
+
+## 五、PVC扩容
+
+### 5.1、扩容块存储
+
+#### 5.1.1、查看当前容量
+
+```bash
+[root@master cephfs]# kubectl get pvc
+NAME             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+########################################################
+mysql-pv-claim   Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   20Gi       RWO            rook-ceph-block   23m
+########################################################
+www-web-0        Bound    pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            rook-ceph-block   13m
+www-web-1        Bound    pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            rook-ceph-block   13m
+www-web-2        Bound    pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            rook-ceph-block   13m
+```
+
+#### 5.1.2、扩容
+
+```bash
+# 原来是20G，修改为25G，修改完以后直接保存退出即可
+[root@master cephfs]# kubectl edit pvc mysql-pv-claim
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"annotations":{},"labels":{"app":"wordpress"},"name":"mysql-pv-claim","namespace":"default"},"spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"20Gi"}},"storageClassName":"rook-ceph-block"}}
+    pv.kubernetes.io/bind-completed: "yes"
+    pv.kubernetes.io/bound-by-controller: "yes"
+    volume.beta.kubernetes.io/storage-provisioner: rook-ceph.rbd.csi.ceph.com
+    volume.kubernetes.io/storage-provisioner: rook-ceph.rbd.csi.ceph.com
+  creationTimestamp: "2024-08-10T02:09:57Z"
+  finalizers:
+  - kubernetes.io/pvc-protection
+  labels:
+    app: wordpress
+  name: mysql-pv-claim
+  namespace: default
+  resourceVersion: "8285"
+  uid: ca39a360-b442-43ef-9bef-3552ebfcd49e
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 25Gi  # 此处修改
+  storageClassName: rook-ceph-block
+  volumeMode: Filesystem
+  volumeName: pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e
+status:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 25Gi   # 此处修改
+  phase: Bound
+```
+
+#### 5.1.3、查看PVC修改结果
+
+- 扩容有一定的延迟，等待一小会，即可看到扩容结果。
+
+```bash
+[root@master cephfs]# kubectl get pvc
+NAME             STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+########################################################
+mysql-pv-claim   Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   25Gi       RWO            rook-ceph-block   26m
+########################################################
+www-web-0        Bound    pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            rook-ceph-block   16m
+www-web-1        Bound    pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            rook-ceph-block   16m
+www-web-2        Bound    pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            rook-ceph-block   16m
+```
+
+#### 5.1.4、查看PV扩容结果
+
+```bash
+[root@master cephfs]# kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                    STORAGECLASS      REASON   AGE
+pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            Delete           Bound    default/www-web-2        rook-ceph-block            16m
+pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            Delete           Bound    default/www-web-0        rook-ceph-block            17m
+########################################################
+pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   25Gi       RWO            Delete           Bound    default/mysql-pv-claim   rook-ceph-block            26m
+########################################################
+pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972   1Gi        RWX            Delete           Bound    kube-system/cephfs-pvc   rook-cephfs                8m9s
+pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            Delete           Bound    default/www-web-1        rook-ceph-block            16m
+```
+
+#### 5.1.5、查看Ceph Dashboard
+
+
+
+#### 5.1.6、查看容器中的扩容结果
+
+```bash
+[root@master cephfs]# kubectl get pod
+NAME                               READY   STATUS    RESTARTS   AGE
+web-0                              1/1     Running   0          19m
+web-1                              1/1     Running   0          19m
+web-2                              1/1     Running   0          19m
+wordpress-mysql-79966d6c5b-2tvzk   1/1     Running   0          29m
+```
+
+```bash
+[root@master cephfs]# kubectl exec -it wordpress-mysql-79966d6c5b-2tvzk -- df -hT
+Filesystem              Type     Size  Used Avail Use% Mounted on
+overlay                 overlay   50G   11G   40G  21% /
+tmpfs                   tmpfs     64M     0   64M   0% /dev
+tmpfs                   tmpfs    1.9G     0  1.9G   0% /sys/fs/cgroup
+shm                     tmpfs     64M     0   64M   0% /dev/shm
+/dev/mapper/centos-root xfs       50G   11G   40G  21% /etc/hosts
+########################################################
+/dev/rbd0               ext4      25G  160M   25G   1% /var/lib/mysql
+########################################################
+tmpfs                   tmpfs    3.6G   12K  3.6G   1% /run/secrets/kubernetes.io/serviceaccount
+tmpfs                   tmpfs    1.9G     0  1.9G   0% /proc/acpi
+tmpfs                   tmpfs    1.9G     0  1.9G   0% /proc/scsi
+tmpfs                   tmpfs    1.9G     0  1.9G   0% /sys/firmware
+```
+
+### 5.2、扩容文件共享型PVC
+
+#### 5.2.1、查看当前容量
+
+```bash
+[root@master cephfs]# kubectl get pvc -n kube-system
+NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+cephfs-pvc   Bound    pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972   1Gi        RWX            rook-cephfs    12m
+```
+
+#### 5.2.2、扩容
+
+- 之前是1G，此处改为2G
+
+```bash
+[root@master cephfs]# kubectl edit pvc cephfs-pvc -n kube-system
+# Please edit the object below. Lines beginning with a '#' will be ignored,
+# and an empty file will abort the edit. If an error occurs while saving this file will be
+# reopened with the relevant failures.
+#
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"annotations":{},"name":"cephfs-pvc","namespace":"kube-system"},"spec":{"accessModes":["ReadWriteMany"],"resources":{"requests":{"storage":"1Gi"}},"storageClassName":"rook-cephfs"}}
+    pv.kubernetes.io/bind-completed: "yes"
+    pv.kubernetes.io/bound-by-controller: "yes"
+    volume.beta.kubernetes.io/storage-provisioner: rook-ceph.cephfs.csi.ceph.com
+    volume.kubernetes.io/storage-provisioner: rook-ceph.cephfs.csi.ceph.com
+  creationTimestamp: "2024-08-10T02:28:42Z"
+  finalizers:
+  - kubernetes.io/pvc-protection
+  name: cephfs-pvc
+  namespace: kube-system
+  resourceVersion: "10542"
+  uid: cdb1a7bf-dcf1-47ab-a963-d5db3f731972
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 2Gi   # 此处修改
+  storageClassName: rook-cephfs
+  volumeMode: Filesystem
+  volumeName: pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972
+status:
+  accessModes:
+  - ReadWriteMany
+  capacity:
+    storage: 2Gi  # 此处修改
+  phase: Bound
+```
+
+#### 5.2.3、查看PVC修改结果
+
+```bash
+[root@master cephfs]# kubectl get pvc -n kube-system
+NAME         STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+cephfs-pvc   Bound    pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972   2Gi        RWX            rook-cephfs    14m
+```
+
+#### 5.2.4、查看PV扩容结果
+
+```bash
+[root@master cephfs]# kubectl get pv
+NAME                                       CAPACITY   ACCESS MODES   RECLAIM POLICY   STATUS   CLAIM                    STORAGECLASS      REASON   AGE
+pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            Delete           Bound    default/www-web-2        rook-ceph-block            23m
+pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            Delete           Bound    default/www-web-0        rook-ceph-block            24m
+pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   25Gi       RWO            Delete           Bound    default/mysql-pv-claim   rook-ceph-block            33m
+########################################################
+pvc-cdb1a7bf-dcf1-47ab-a963-d5db3f731972   2Gi        RWX            Delete           Bound    kube-system/cephfs-pvc   rook-cephfs                15m
+########################################################
+pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            Delete           Bound    default/www-web-1        rook-ceph-block            23m
+```
+
+#### 5.2.5、查看容器中的扩容结果
+
+```bash
+[root@master cephfs]# kubectl get pod -n kube-system | grep kube-registry
+kube-registry-c89875cd9-45mxc    1/1     Running   0             13m
+kube-registry-c89875cd9-fqcgc    1/1     Running   0             13m
+kube-registry-c89875cd9-k4g76    1/1     Running   0             13m
+```
+
+```bash
+# 随便进入一个Pod
+[root@master cephfs]# kubectl exec -it -n kube-system kube-registry-c89875cd9-k4g76 -- df -hT
+Filesystem           Type            Size      Used Available Use% Mounted on
+overlay              overlay        50.0G     10.9G     39.1G  22% /
+tmpfs                tmpfs          64.0M         0     64.0M   0% /dev
+tmpfs                tmpfs           1.8G         0      1.8G   0% /sys/fs/cgroup
+shm                  tmpfs          64.0M         0     64.0M   0% /dev/shm
+/dev/mapper/centos-root
+                     xfs            50.0G     10.9G     39.1G  22% /dev/termination-log
+/dev/mapper/centos-root
+                     xfs            50.0G     10.9G     39.1G  22% /etc/resolv.conf
+/dev/mapper/centos-root
+                     xfs            50.0G     10.9G     39.1G  22% /etc/hostname
+/dev/mapper/centos-root
+                     xfs            50.0G     10.9G     39.1G  22% /etc/hosts
+########################################################
+10.1.175.144:6789,10.1.69.178:6789,10.1.191.124:6789:/volumes/csi/csi-vol-b4fd2864-d2e5-4b23-96f5-253acd064a4a/362c911d-cd05-4e84-a39e-07687e84a2a6
+                     ceph            2.0G         0      2.0G   0% /var/lib/registry                   ########################################################
+tmpfs                tmpfs         100.0M     12.0K    100.0M   0% /run/secrets/kubernetes.io/serviceaccount
+tmpfs                tmpfs           1.8G         0      1.8G   0% /proc/acpi
+tmpfs                tmpfs          64.0M         0     64.0M   0% /proc/kcore
+tmpfs                tmpfs          64.0M         0     64.0M   0% /proc/keys
+tmpfs                tmpfs          64.0M         0     64.0M   0% /proc/timer_list
+tmpfs                tmpfs          64.0M         0     64.0M   0% /proc/timer_stats
+tmpfs                tmpfs          64.0M         0     64.0M   0% /proc/sched_debug
+tmpfs                tmpfs           1.8G         0      1.8G   0% /proc/scsi
+tmpfs                tmpfs           1.8G         0      1.8G   0% /sys/firmware
+
+```
+
+## 六、PVC快照
+
+- PVC快照功能和使用云服务器或者虚拟机的快照功能类型，可以针对存储某一刻的状态进行一个快照，无论数据出现严重丢失或者其他情况，都可以回滚数据。
+
+### 6.1、安装snapshot控制器
+
+- 要想实现PVC的快照功能，需要snapshot控制器，在Kubernetes1.19版本以上需要单独安装snapshot控制器。如果是1.19以下的版本，则不需要单独安装。
+
+```bash
+[root@master ~]# tar -zxvf k8s-ha-install.git.tar.gz 
+[root@master ~]# cd k8s-ha-install/
+[root@master k8s-ha-install]# yum -y install git
+[root@master k8s-ha-install]# git checkout manual-installation-v1.20.x
+[root@master k8s-ha-install]# kubectl apply -f snapshotter/ -n kube-system 
+[root@master k8s-ha-install]# kubectl get pod -n kube-system -l app=snapshot-controller
+NAME                    READY   STATUS    RESTARTS   AGE
+snapshot-controller-0   1/1     Running   0          32s
+```
+
+### 6.2、创建SnapshotClass
+
+- SnapshotClass是创建快照的类。
+
+```bash
+[root@master rbd]# pwd
+/root/rook/deploy/examples/csi/rbd
+```
+
+```bash
+[root@master rbd]# kubectl apply -f snapshotclass.yaml
+```
+
+### 6.3、创建快照
+
+- 首先在之前创建的MySQL容器中创建一个文件夹，并创建文件。
+
+```bash
+[root@master rbd]# kubectl get pod
+NAME                               READY   STATUS    RESTARTS   AGE
+web-0                              1/1     Running   0          33m
+web-1                              1/1     Running   0          32m
+web-2                              1/1     Running   0          32m
+wordpress-mysql-79966d6c5b-2tvzk   1/1     Running   0          42m
+```
+
+#### 6.3.1、登录容器创建测试文件
+
+```bash
+[root@master rbd]# kubectl exec -it wordpress-mysql-79966d6c5b-2tvzk -- sh -c 'date > /var/lib/mysql/time.txt'
+```
+
+#### 6.3.2、修改snapshot.yaml文件
+
+```bash
+[root@master rbd]# cat snapshot.yaml 
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: rbd-pvc-snapshot
+spec:
+  volumeSnapshotClassName: csi-rbdplugin-snapclass
+  source:
+    persistentVolumeClaimName: mysql-pv-claim  # 修改为需要做快照的PVC
+```
+
+#### 6.3.3、创建快照
+
+```bash
+[root@master rbd]# kubectl apply -f snapshot.yaml
+```
+
+#### 6.3.4、查看快好结果
+
+```bash
+# 如果能看到true表示快照创建成功
+[root@master rbd]# kubectl get volumesnapshot
+NAME               READYTOUSE   SOURCEPVC        SOURCESNAPSHOTCONTENT   RESTORESIZE   SNAPSHOTCLASS             SNAPSHOTCONTENT                                    CREATIONTIME   AGE
+rbd-pvc-snapshot   true         mysql-pv-claim                           25Gi          csi-rbdplugin-snapclass   snapcontent-91a524b1-7f0b-4db3-8330-e68832b02314   33s            34s
+```
+
+### 6.4、恢复快照
+
+#### 6.4.1、使用快照恢复数据
+
+- 备注：	
+  - storageClassName：rook-ceph-block  新建PVC的StorageClass
+  - dataSource：快照名称
+    - storage：20Gi  大小不能小于原来的值
+
+```bash
+[root@master rbd]# cat pvc-restore.yaml 
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rbd-pvc-restore
+spec:
+  storageClassName: rook-ceph-block  # 注意
+  dataSource:
+    name: rbd-pvc-snapshot   # 注意
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 25Gi  # 注意
+```
+
+#### 6.4.2、执行恢复动作
+
+```bash
+[root@master rbd]# kubectl apply -f pvc-restore.yaml
+```
+
+#### 6.4.3、查看结果
+
+```bash
+[root@master rbd]# kubectl get pvc
+NAME              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+mysql-pv-claim    Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   25Gi       RWO            rook-ceph-block   49m
+########################################################
+rbd-pvc-restore   Bound    pvc-2edbe08f-c356-4309-a7e2-0b0ba44b505d   25Gi       RWO            rook-ceph-block   26s
+########################################################
+www-web-0         Bound    pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            rook-ceph-block   40m
+www-web-1         Bound    pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            rook-ceph-block   39m
+www-web-2         Bound    pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            rook-ceph-block   39m
+```
+
+### 6.5、查看快照数据
+
+#### 6.5.1、创建容器
+
+- 创建一个容器，挂载用快照恢复的PVC，并查看里面我们创建的文件
+
+```bash
+[root@master rbd]# vim restore-check-snapshot-rbd.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: check-snapshot-restore
+spec:
+  selector:
+    matchLabels:
+      app: check 
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: check 
+    spec:
+      containers:
+      - image: alpine:3.8
+        name: check
+        command:
+        - sh
+        - -c
+        - sleep 36000
+        volumeMounts:
+        - name: check-mysql-persistent-storage
+          mountPath: /mnt
+      volumes:
+      - name: check-mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: rbd-pvc-restore   # 注意
+```
+
+```bash
+[root@master rbd]# kubectl apply -f restore-check-snapshot-rbd.yaml
+```
+
+#### 6.5.2、查看结果
+
+```bash
+[root@master rbd]# kubectl get pod
+NAME                                      READY   STATUS    RESTARTS   AGE
+check-snapshot-restore-6df758bdd6-kbjfh   1/1     Running   0          14s
+web-0                                     1/1     Running   0          49m
+web-1                                     1/1     Running   0          49m
+web-2                                     1/1     Running   0          48m
+wordpress-mysql-79966d6c5b-2tvzk          1/1     Running   0          58m
+```
+
+```bash
+[root@master rbd]# kubectl exec -it check-snapshot-restore-6df758bdd6-kbjfh -- cat /mnt/time.txt
+Sat Aug 10 02:53:25 UTC 2024
+```
+
+## 七、PVC克隆
+
+- 和虚拟机类似，PVC也支持克隆，可以基于某个PVC复制出一个一摸一样数据的新的PVC
+
+### 7.1、创建克隆
+
+- 注意：
+  - dataSource的name被被克隆的PVC的名字，在此是mysql-pv-claim
+  - StorageClassName是新建的PVC的StorageClass名称
+  - Storage大小不能小于之前的PVC的大小
+
+```bash
+[root@master rbd]# vim pvc-clone.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rbd-pvc-clone
+spec:
+  storageClassName: rook-ceph-block
+  dataSource:
+    name: mysql-pv-claim  # 指定要克隆的PVC的名字
+    kind: PersistentVolumeClaim 
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 25Gi   # 设置克隆的大小
+```
+
+### 7.2、开始克隆
+
+```bash
+[root@master rbd]# kubectl apply -f pvc-clone.yaml
+[root@master rbd]# kubectl get pvc
+NAME              STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS      AGE
+mysql-pv-claim    Bound    pvc-ca39a360-b442-43ef-9bef-3552ebfcd49e   25Gi       RWO            rook-ceph-block   63m
+########################################################
+rbd-pvc-clone     Bound    pvc-576519d4-fda3-40df-8622-17cb9210e6d6   25Gi       RWO            rook-ceph-block   8s
+########################################################
+rbd-pvc-restore   Bound    pvc-2edbe08f-c356-4309-a7e2-0b0ba44b505d   25Gi       RWO            rook-ceph-block   14m
+www-web-0         Bound    pvc-8f523d36-3833-441e-8269-cac660a8756b   1Gi        RWO            rook-ceph-block   53m
+www-web-1         Bound    pvc-f39db89f-d2f8-4f05-8734-f0b01b8cdfbc   1Gi        RWO            rook-ceph-block   53m
+www-web-2         Bound    pvc-69b9051a-ac6f-4404-9a8e-8f6399acf33e   1Gi        RWO            rook-ceph-block   53m
+```
+
