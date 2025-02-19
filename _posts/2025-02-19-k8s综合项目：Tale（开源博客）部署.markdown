@@ -1,0 +1,552 @@
+---
+layout:       post
+title:        "Kubernetes综合项目：Tale（开源博客）部署"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# 综合项目：Tale（开源博客）部署
+
+[TOC]
+
+## 一、项目介绍
+
+- Tale使用轻量级的`mvc`框架`Blade`进行开发。本项目皆在让大家了解Kubernetes上面怎么部署项目，把我们学到的技术整体串通。
+
+### 1.1、特性
+
+- 设计简洁，界面美观
+- Markdown文章发布
+- 自定义文章连接
+- 支持多主题
+- 支持插件扩展
+- 支持Emoji表情
+- 支持网易音乐播放
+- 支持附件和数据库备份
+- 部署简单，不依赖Tomcat
+- 无须数据库，内嵌Sqlite
+
+### 1.2、流程
+
+- 本项目的流程是先准备好Kubernetes集群以及Harbor镜像仓库，Kubernetes集群部署项目的时候会从Harbor里面拉取镜像，所有准备好环境以后开始构建项目并且推送到镜像仓库，然后再部署项目。
+
+## 资源列表
+
+| 操作系统   | 配置 | IP             | 主机名 | 备注        |
+| ---------- | ---- | -------------- | ------ | ----------- |
+| CentOS 7.9 | 2C4G | 192.168.93.101 | master | K8S主节点   |
+| CentOS 7.9 | 2C4G | 192.168.93.102 | node1  | K8S工作节点 |
+| CentOS 7.9 | 2C4G | 192.168.93.103 | node2  | K8S工作节点 |
+| CentOS 7.9 | 2C4G | 192.168.93.104 | harbor | 镜像仓库    |
+
+## 基础环境
+
+- 关闭防火墙
+
+```bash
+systemctl stop firewalld
+systemctl disable firewalld
+```
+
+- 关闭内核安全机制
+
+```bash
+setenforce 0
+sed -i "s/.*SELINUX=.*/SELINUX=disabled/g" /etc/selinux/config
+```
+
+- 添加hosts解析
+
+```bash
+cat >> /etc/hosts << EOF
+192.168.93.101 k8s-master
+192.168.93.102 k8s-node01
+192.168.93.103 k8s-node02
+192.168.93.104 harbor
+EOF
+```
+
+## 二、查看Kubernetes集群状态
+
+- 部署`Kubernetes`省略
+
+### 2.1、查看Pod状态
+
+```bash
+[root@master ~]# kubectl get pod -A
+NAMESPACE      NAME                             READY   STATUS    RESTARTS   AGE
+kube-flannel   kube-flannel-ds-gznfs            1/1     Running   0          14d
+kube-flannel   kube-flannel-ds-jb9vq            1/1     Running   0          14d
+kube-flannel   kube-flannel-ds-xl6dr            1/1     Running   0          14d
+kube-system    coredns-6d8c4cb4d-g5nfk          1/1     Running   0          14d
+kube-system    coredns-6d8c4cb4d-xqvh6          1/1     Running   0          14d
+kube-system    etcd-master                      1/1     Running   0          14d
+kube-system    kube-apiserver-master            1/1     Running   0          14d
+kube-system    kube-controller-manager-master   1/1     Running   0          14d
+kube-system    kube-proxy-9pftl                 1/1     Running   0          14d
+kube-system    kube-proxy-gdqk7                 1/1     Running   0          14d
+kube-system    kube-proxy-h7gm2                 1/1     Running   0          14d
+kube-system    kube-scheduler-master            1/1     Running   0          14d
+```
+
+### 2.2、查看节点状态
+
+```bash
+[root@master ~]# kubectl get node
+NAME     STATUS   ROLES                  AGE   VERSION
+master   Ready    control-plane,master   14d   v1.23.0
+node1    Ready    <none>                 14d   v1.23.0
+node2    Ready    <none>                 14d   v1.23.0
+```
+
+### 2.3、查看集群组件状态
+
+```bash
+[root@master ~]# kubectl get cs
+Warning: v1 ComponentStatus is deprecated in v1.19+
+NAME                 STATUS    MESSAGE                         ERROR
+controller-manager   Healthy   ok                              
+scheduler            Healthy   ok                              
+etcd-0               Healthy   {"health":"true","reason":""}   
+```
+
+## 四、部署Harbor私有仓库
+
+### 4.1、安装Docker
+
+```bash
+# 安装依赖环境
+yum install -y yum-utils device-mapper-persistent-data lvm2
+# 添加CentOS阿里云官方镜像站
+yum-config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+yum clean all && yum makecache
+# 安装Docker
+yum -y install docker-ce docker-ce-cli containerd.io
+# 启动Docker
+systemctl start docker
+systemctl enable docker
+```
+
+### 4.2、准备Docker-Compose
+
+```bash
+# 下载阿里云docker-compose二进制文件
+[root@harbor ~]# curl -L https://mirrors.aliyun.com/docker-toolbox/linux/compose/1.21.2/docker-compose-Linux-x86_64 -o /usr/local/bin/docker-compose
+# 添加可执行权限
+[root@harbor ~]# chmod +x /usr/local/bin/docker-compose
+# 查看docker-compose版本
+[root@harbor ~]# docker-compose -v
+docker-compose version 1.21.2, build a133471
+```
+
+### 4.3、安装Harbor
+
+```bash
+[root@harbor ~]# tar -zxvf harbor-offline-installer-v2.2.1.tgz -C /usr/local/
+[root@harbor ~]# cp /usr/local/harbor/harbor.yml.tmpl /usr/local/harbor/harbor.yml
+```
+
+```bash
+[root@harbor ~]# vim /usr/local/harbor/harbor.yml
+# 修改为自己的IP
+hostname: 192.168.93.104
+
+
+# 注释掉https访问
+#https:
+  # https port for harbor, default is 443
+ # port: 443
+  # The path of cert and key files for nginx
+  #certificate: /your/certificate/path
+  #private_key: /your/private/key/path
+```
+
+```bash
+# 进行预检查
+[root@harbor ~]# /usr/local/harbor/prepare
+```
+
+```bash
+# 安装
+[root@harbor ~]# /usr/local/harbor/install.sh 
+```
+
+```bash
+# 查看容器状态是否正常
+[root@harbor ~]# docker ps
+CONTAINER ID   IMAGE                                COMMAND                   CREATED              STATUS                        PORTS                                   NAMES
+68cba5bb7c11   goharbor/harbor-jobservice:v2.2.1    "/harbor/entrypoint.…"   About a minute ago   Up About a minute (healthy)                                           harbor-jobservice
+5e1256fd3158   goharbor/nginx-photon:v2.2.1         "nginx -g 'daemon of…"   About a minute ago   Up About a minute (healthy)   0.0.0.0:80->8080/tcp, :::80->8080/tcp   nginx
+62b1e7f2d0d7   goharbor/harbor-core:v2.2.1          "/harbor/entrypoint.…"   About a minute ago   Up About a minute (healthy)                                           harbor-core
+f8ff25b755d4   goharbor/redis-photon:v2.2.1         "redis-server /etc/r…"   About a minute ago   Up About a minute (healthy)                                           redis
+fdeea966d044   goharbor/harbor-portal:v2.2.1        "nginx -g 'daemon of…"   About a minute ago   Up About a minute (healthy)                                           harbor-portal
+3c85fbe88e7c   goharbor/harbor-db:v2.2.1            "/docker-entrypoint.…"   About a minute ago   Up About a minute (healthy)                                           harbor-db
+5b90e3a26b2e   goharbor/registry-photon:v2.2.1      "/home/harbor/entryp…"   About a minute ago   Up About a minute (healthy)                                           registry
+ef413a624c53   goharbor/harbor-registryctl:v2.2.1   "/home/harbor/start.…"   About a minute ago   Up About a minute (healthy)                                           registryctl
+b0a435b9ca81   goharbor/harbor-log:v2.2.1           "/bin/sh -c /usr/loc…"   About a minute ago   Up About a minute (healthy)   127.0.0.1:1514->10514/tcp               harbor-log
+```
+
+### 4.4、创建项目
+
+```bash
+# 通过浏览器访问
+http://192.168.93.104
+# 创建一个项目叫dev
+```
+
+- 账号：admin
+- 密码：Harbor12345
+
+![image-20240708173943456](https://github.com/user-attachments/assets/c4ae7a5d-e011-4821-a646-33baec9218ca)
+
+
+![image-20240708174005625](https://github.com/user-attachments/assets/e4b34dce-76f4-4ea8-b9f9-3c5bb46183a0)
+
+
+### 4.5、Kubernetes节点配置镜像仓库
+
+- 所有的`K8S`节点配置镜像仓库
+
+```bash
+[root@master ~]# cat /etc/docker/daemon.json 
+{  
+  "exec-opts": ["native.cgroupdriver=systemd"],  
+  "insecure-registries":["192.168.93.104"]
+}
+```
+
+```bash
+# 重启Docker
+[root@master ~]# systemctl daemon-reload 
+[root@master ~]# systemctl restart docker
+```
+
+```bash
+# 连接仓库，换成自己的Harbor的地址（所有节点都要操作）
+[root@master ~]# docker login -uadmin -pHarbor12345 http://192.168.93.104
+WARNING! Using --password via the CLI is insecure. Use --password-stdin.
+WARNING! Your password will be stored unencrypted in /root/.docker/config.json.
+Configure a credential helper to remove this warning. See
+https://docs.docker.com/engine/reference/commandline/login/#credentials-store
+
+Login Succeeded
+```
+
+## 五、构建镜像
+
+- `Master`节点操作即可
+
+### 5.1、编写Dockerfile
+
+```bash
+# 创建工作目录
+[root@master ~]# mkdir /tale
+[root@master ~]# cd /tale/
+[root@master tale]# cat Dockerfile
+FROM centos:7.6.1810 as builder
+COPY apache-maven-3.6.0-bin.tar.gz /opt
+COPY tale.tar.gz /opt
+COPY jdk-8u202-linux-x64.tar.gz /opt
+RUN curl -o /etc/yum.repos.d/CentOS-Base.repo https://mirrors.aliyun.com/repo/Centos-7.repo
+RUN yum -y install which && \
+cd /opt && tar zxf apache-maven-3.6.0-bin.tar.gz && \
+tar zxvf jdk-8u202-linux-x64.tar.gz && \
+mv jdk1.8.0_202/ /usr/local/java/ && \
+mv apache-maven-3.6.0 /usr/local/maven && \
+echo 'export JAVA_HOME=/usr/local/java/' >> /etc/profile && \
+echo 'CLASSPATH=$JAVA_HOME/lib/tools.jar:$JAVA_HOME/lib/dt.jar' >> /etc/profile && \
+echo 'PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile && \
+source /etc/profile && \
+tar zxf tale.tar.gz && \
+cd /opt/tale && \
+/usr/local/maven/bin/mvn clean package && \
+cd /opt/tale/target && \
+tar zcvf dist.tar.gz dist 
+
+FROM docker.io/openjdk:8u121-jdk
+COPY --from=builder /opt/tale/target/dist.tar.gz /tmp
+
+RUN mkdir /tale && \
+cd /tmp && tar zxf dist.tar.gz && \
+cp dist/*.tar.gz /tale && \
+cd /tale && \
+tar zxf *.tar.gz
+
+ENV TALE_HOME /tale
+
+EXPOSE 9000
+
+COPY run.sh /run.sh
+RUN chmod 700 /run.sh
+ENTRYPOINT ["/run.sh"]
+```
+
+### 5.2、编写run.sh
+
+```bash
+[root@master tale]# cat run.sh 
+#!/bin/bash
+
+#find tale jar package
+TALE_NAME=$(find $TALE_HOME -name "tale*.jar")
+
+echo $TALE_NAME 
+
+#run the tale
+java -Xms256m -Xmx256m -Dfile.encoding=UTF-8 -jar $TALE_NAME
+```
+
+### 5.3、上传软件包
+
+- tale.tar.gz是项目愿代牧，可以从https://github.com/otale/tale.giti下载，这里已经下载好了，直接使用即可。
+
+- jdk-8u202-linux-x64.tar.gz是jdk软件包，用于给tale项目提供java支持
+- apache-maven-3.6.0-bin.tar.gz用于构建项目
+
+```bash
+[root@master tale]# ls
+apache-maven-3.6.0-bin.tar.gz  Dockerfile                  run.sh
+centos-jdk-images.tar.gz       jdk-8u202-linux-x64.tar.gz  tale.tar.gz
+```
+
+### 5.4、构建镜像
+
+```bash
+# 加载基础镜像
+[root@master tale]# docker load < centos-jdk-images.tar.gz 
+
+
+# 构建镜像
+[root@master tale]# docker build -t 192.168.93.104/dev/tale:v1 .
+```
+
+### 5.5、推送镜像
+
+```bash
+[root@master tale]# docker push 192.168.93.104/dev/tale:v1
+```
+
+### 5.6、部署Ingress Controller
+
+```bash
+[root@master ~]# kubectl apply -f deploy.yaml 
+```
+
+## 六、部署tale
+
+### 6.1、配置Harbor的账号和密码
+
+- 因为本次Harbor仓库创建的项目没有勾选公开，所以拉取镜像的时候需要凭证，我们再部署项目前要先配置好凭证。
+
+```bash
+[root@master ~]# cat harbor.txt 
+{
+  "auths": {
+    "192.168.93.104": {
+      "username": "admin",
+      "password": "Harbor12345"
+    }
+  }
+}
+
+
+# 使用base64对数据内容进行加密
+[root@master ~]# cat harbor.txt | base64
+ewogICJhdXRocyI6IHsKICAgICIxOTIuMTY4LjkzLjEwNCI6IHsKICAgICAgInVzZXJuYW1lIjog
+ImFkbWluIiwKICAgICAgInBhc3N3b3JkIjogIkhhcmJvcjEyMzQ1IgogICAgfQogIH0KfQoK
+```
+
+### 6.2、编写tale.yaml文件
+
+- 注意：修改dockerconfigjson的值，填写刚才自己加密后的内容
+- 注意：修改yaml文件中image地址
+
+```bash
+[root@master ~]# cat tale.yaml 
+apiVersion: v1
+kind: Namespace
+metadata:
+   name: dev
+   
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: myregistry 
+  namespace: dev
+type: kubernetes.io/dockerconfigjson  
+data:
+# 加密内容为一行内容
+#####################################################################
+  .dockerconfigjson: ewogICJhdXRocyI6IHsKICAgICIxOTIuMTY4LjkzLjEwNCI6IHsKICAgICAgInVzZXJuYW1lIjogImFkbWluIiwKICAgICAgInBhc3N3b3JkIjogIkhhcmJvcjEyMzQ1IgogICAgfQogIH0KfQoK
+#####################################################################
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tale-deployment
+  namespace: dev
+  labels:
+    app: tale
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tale
+  template:
+    metadata:
+      labels:
+        app: tale
+    spec:
+      imagePullSecrets: 
+      - name: myregistry # 指定使用myregistry这个Secret来进行镜像仓库的认证
+      containers:
+      - name: tale
+#####################################################################
+        image: 192.168.93.104/dev/tale:v1
+#####################################################################
+        ports:
+        - containerPort: 9000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tale
+  namespace: dev
+spec:
+  ports:
+    - port: 9000
+      protocol: TCP
+      targetPort: 9000 #service常见配置错误的地方，targetPort必须是pod暴露的端口，不能是其他的
+  selector:
+    app: tale
+  sessionAffinity: None
+  type: NodePort
+  
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tale
+  namespace: dev
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+    - host: dev.tale.com # 访问的域名
+      http:
+        paths:
+          - path: /
+            pathType:  Prefix
+            backend:
+              service:
+                name: tale
+                port:
+                  number: 9000
+
+```
+
+### 6.3、部署项目
+
+```bash
+[root@master ~]# kubectl apply -f tale.yaml 
+namespace/dev created
+secret/myregistry created
+deployment.apps/tale-deployment created
+service/tale created
+ingress.networking.k8s.io/tale created
+```
+
+```bash
+[root@master ~]# kubectl get pod -n dev
+NAME                               READY   STATUS    RESTARTS   AGE
+tale-deployment-55dfffc7dc-4fxmt   1/1     Running   0          25s
+tale-deployment-55dfffc7dc-58wsv   1/1     Running   0          25s
+```
+
+```bash
+[root@master ~]# kubectl get svc -n dev
+NAME   TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)          AGE
+tale   NodePort   10.1.179.189   <none>        9000:31910/TCP   44s
+```
+
+```bash
+[root@master ~]# kubectl get ingress -n dev
+NAME   CLASS    HOSTS          ADDRESS   PORTS   AGE
+tale   <none>   dev.tale.com             80      64s
+```
+
+## 七、访问tale
+
+```bash
+[root@master ~]# kubectl get svc -n dev
+NAME   TYPE       CLUSTER-IP     EXTERNAL-IP   PORT(S)          AGE
+tale   NodePort   10.1.179.189   <none>        9000:31910/TCP   92s
+```
+
+```bash
+[root@master ~]# kubectl get ingress -n dev
+NAME   CLASS    HOSTS          ADDRESS   PORTS   AGE
+tale   <none>   dev.tale.com             80      111s
+```
+
+```bash
+[root@master ~]# kubectl get svc -n ingress-nginx
+NAME                                 TYPE           CLUSTER-IP     EXTERNAL-IP   PORT(S)                      AGE
+ingress-nginx-controller             LoadBalancer   10.1.136.209   <pending>     80:31831/TCP,443:30682/TCP   7m41s
+ingress-nginx-controller-admission   ClusterIP      10.1.117.126   <none>        443/TCP                      7m41s
+```
+
+```bash
+[root@master ~]# kubectl describe svc -n ingress-nginx ingress-nginx-controllerName:                     ingress-nginx-controller
+Namespace:                ingress-nginx
+Labels:                   app.kubernetes.io/component=controller
+                          app.kubernetes.io/instance=ingress-nginx
+                          app.kubernetes.io/name=ingress-nginx
+                          app.kubernetes.io/part-of=ingress-nginx
+                          app.kubernetes.io/version=1.6.4
+Annotations:              <none>
+Selector:                 app.kubernetes.io/component=controller,app.kubernetes.io/instance=ingress-nginx,app.kubernetes.io/name=ingress-nginx
+Type:                     LoadBalancer
+IP Family Policy:         SingleStack
+IP Families:              IPv4
+IP:                       10.1.136.209
+IPs:                      10.1.136.209
+Port:                     http  80/TCP
+TargetPort:               http/TCP
+NodePort:                 http  31831/TCP
+#####################################################################
+Endpoints:                192.168.93.103:80
+#####################################################################
+Port:                     https  443/TCP
+TargetPort:               https/TCP
+NodePort:                 https  30682/TCP
+#####################################################################
+Endpoints:                192.168.93.103:443
+#####################################################################
+Session Affinity:         None
+External Traffic Policy:  Local
+HealthCheck NodePort:     31159
+Events:                   <none>
+```
+
+```bash
+# 在要进行访问的机器上添加hosts解析，解析内容为上面查看的ip地址
+192.168.93.103 dev.tale.com
+```
+
+- 然后进行浏览器访问 `dev.tale.com`
+
+![image-20240708195356604](https://github.com/user-attachments/assets/13f93cf0-5b09-4eec-97fa-7609025d9aa5)
+
+
+
+- 安装完成之后访问http://http://dev.tale.com/，即可看到以下内容
+
+![image-20240708195459652](https://github.com/user-attachments/assets/13750863-b4d8-47e5-88a6-1e235ca10bac)
+
+
