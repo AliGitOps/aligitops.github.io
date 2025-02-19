@@ -1,0 +1,869 @@
+---
+layout:       post
+title:        "Kubernetes高级功能2"
+author:       "Hux"
+header-style: text
+catalog:      true
+tags:
+    - Web
+    - JavaScript
+---
+# Kubernetes高级功能
+
+[TOC]
+
+## 一、资源配额
+
+### 1.1、什么是资源配额
+
+- 当多个用户或团队共享具有固定节点数目的集群时，人们会担心有人使用超过其基于公平原则所分配到的资源量
+- 资源配额是帮助管理员解决这一问题的工具。
+- 资源配额，通过ResourceQuota对象来定义，对每个命名空间的资源消耗总量提供限制。它可以限制命名空间中某种类型的对象的总数目上限，也可以限制命名空间中的Pod可以使用的计算资源的总上限。
+- 对于cpu和memory资源：ResourceQuota强制该命名空间中的每个（新）Pod为该资源设置限制。如果你在命名空间中为cpu和memory实施资源配额，你或其他客户端必须为你提交的每个新Pod指定资源的requests或limits。否则，控制平面可能会决绝接纳该Pod。
+- 对于其他资源：ResourceQuota可以工作，并且会忽略命名空间中的Pod。而无需为该资源设置限制或请求。这意味着，如果资源配额限制了此命名空间的临时存储，则可以创建没有限制/请求临时存储的新Pod。你可以使用限制范围自动设置对这些资源的默认请求。
+
+### 1.2、资源配额应用
+
+#### 1.2.1、针对Namespace设置资源配额
+
+- 创建的ResourceQuota对象将在test命名空间添加限制，每个容器必须设置内存请求（memory request），内存限额（memory limit），cpu请求（cpu request）和cpu限额（cpu limit），所有容器的内存请求总额不得超过2GiB，所有容器的内存限额总额不得超过4GiB，所有容器的CPU请求总额不得超过2CPU，所有容器的CPU限额不得超过4CPU
+
+```bash
+[root@master ~]# cat namespace_ResourceQuota.yaml 
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: mem-cpu-quota
+  namespace: test
+spec:
+  hard:
+    # 启动Pod时所有Pod请求的CPU个数不得超过2个
+    requests.cpu: "2"
+    # 启动Pod时所有Pod请求的内存总和不得超过2G
+    requests.memory: "2Gi"
+    # 限制所有Pod的CPU请求总和不得超过4个
+    limits.cpu: "4"
+    # 限制所有Pod的内存请求总和不得超过4G
+    limits.memory: "4Gi"
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f namespace_ResourceQuota.yaml 
+namespace/test created
+resourcequota/mem-cpu-quota created
+
+
+# 可以通过describe查看test命名空间中我们设置的资源配额限制
+[root@master ~]# kubectl describe ns test
+Name:         test
+Labels:       kubernetes.io/metadata.name=test
+Annotations:  <none>
+Status:       Active
+
+Resource Quotas
+  Name:            mem-cpu-quota
+  Resource         Used  Hard
+  --------         ---   ---
+  limits.cpu       0     4
+  limits.memory    0     4Gi
+  requests.cpu     0     2
+  requests.memory  0     2Gi
+
+No LimitRange resource.
+```
+
+#### 1.2.2、针对Pod设置资源配额
+
+- 对于有资源限制的命名空间，下面的Pod，创建Pod时候必须设置资源限额。否则创建失败
+- requests：代表容器启动请求的资源限制，分配的资源必须要达到此要求。
+- limits：代表最多可以请求多少资源
+- 单位m：CPU的计量单位叫毫核(m)。一个节点的CPU核心数量乘以1000，得到的就是节点的总的CPU总数量。如，一个节点有两个核，那么该节点的CPU总量为2000m。
+
+```bash
+# 该容器启动时请求500/2000的核心（%25）
+[root@master ~]# cat pod_resources.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-nginx
+  namespace: test
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    # 定义了容器请求和限制的资源量
+    resources:
+    # 定义容器请求资源量
+      requests:
+        # 容器启动时请求100MiB的内存
+        memory: "100Mi"
+        # 启动启动时请求500mCPU(即0.5个CPU核心)
+        cpu: "500m"
+      # 定义容器限制资源量
+      limits:
+        # 容器可使用的最大内存限制为2GiB 
+        memory: "2Gi"
+        # 启动可使用的最大CPU限制为2个CPU核心
+        cpu: "2" 
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f pod_resources.yaml 
+pod/test-nginx created
+```
+
+## 二、HorizontalPodAutoscaler（HPA）
+
+### 2.1、什么是HorizontalPodAutoscaler
+
+- HorizontalPodAutoscaler简称HAP，用来自动化的去扩缩容，防止以外的业务量增大导致管理员措手不及，Kubernetes为我们提供了这样一个资源对象：HorizontalPodAutoscaler（Pod水平自动伸缩），简称HPA。HPA通过监控分析RC或Deployment控制的所有Pod的负载变化情况来确定是否需要调整Pod的副本数量，这是HPA最基本的原理。
+
+- HorizontalPodAutoscaler（简称HAP）自动更新工作负载资源（例如Deployment或StatefulSet），目的是自动扩缩工作负载以满足需求。
+- 水平扩缩意味着对增加的负载的响应是部署更多的Pod。这与“垂直扩缩”不同，对于Kubernetes，垂直扩缩意味着将更多资源（例如：内存或CPU）分配给已经为工作负载运行的Pod。
+- 如果负载减少，并且Pod的数量高于配置的最小值，HorizontalPodAutoscaler会指示工作资源（Deployment、StatefulSet、或其他类资源）缩减
+
+### 2.2、HorizontalPodAutoscaler支持的指标
+
+- HPA支持的指标可以使用kubectl api-versions | grep autoscal命令查询
+
+```bash
+[root@master ~]# kubectl api-versions | grep autoscal
+autoscaling/v1
+autoscaling/v2
+autoscaling/v2beta1
+autoscaling/v2beta2
+
+
+# autoscaling/v1：只支持基于CPU的缩放
+# autoscaling/v2：支持Resource Metrics（资源指标，如pod的CPU。内存）和Custom Metrics（自定义指标）的缩放
+# autoscaling/v2beta1：支持Resource Metrics（资源指标，如Pod的CPU，内存）和Custom Metrics（自定义指标）和ExternalMetrics（额外指标）的缩放，但是目前也仅仅是出于beta阶段
+# autoscaling/v2beta2（稳定版本）：其中包括对基于内存和自定义指标扩缩的支持
+```
+
+### 2.3、指标来源
+
+- HPA会像资源监控系统获取Pod的资源使用情况，资源监控系统是容器编排系统必不可少的自建，它为用户提供了快速了解系统资源分配和利用状态的有效突进，同时也是系统编排赖以实现的基础要件。
+- 老的版本使用Heapster进行资源各项资源指标数据的采集，从Kubernetes1.11开始Heapster被废弃不在使用，metrics-server替代了Heapster
+- K8S从1.8版本卡死hi，CPU、内存的等资源的信息可以通过Metrics API来获取，用户可以直接获取这些metrics信息（例如通过执行kubectl top），HAP使用这些metaics信息来实现动态的伸缩
+
+​		**Metrics API：**
+
+- 通过Metrics API我们可以获取到指定node或者pod的当前资源使用情况，API本身不存储任何信息，所以我们不可以通过API来获取资源的历史使用情况
+- Mterics API的获取路径位于：/apis/metrics.k8s.io/
+- 获取Metrics API的前提条件是metrics server要在K8S集群中成功部署
+- 更多有关metrics资源请参考：https://github.com/kubernetes/metrics
+
+​		**Metrics server：**
+
+- Metrics server是K8S集群资源使用情况的集合器
+- 从1.8版本开始，Metrics server默认可以通过kubectl-up.sh脚本以deployment的方式进行部署，也可以通过yaml文件的方式进行部署
+- metrics server收集所有node节点的metrics信息
+
+### 2.4、HorizontalPodAutoscaler应用
+
+#### 2.4.1、部署Metrics
+
+```bash
+# 加载配置文件以后需要等待1分钟左右，使其配置加载成功，再使用top查询node节点的资源使用情况
+[root@master ~]# kubectl apply -f components.yaml 
+serviceaccount/metrics-server created
+clusterrole.rbac.authorization.k8s.io/system:aggregated-metrics-reader created
+clusterrole.rbac.authorization.k8s.io/system:metrics-server created
+rolebinding.rbac.authorization.k8s.io/metrics-server-auth-reader created
+clusterrolebinding.rbac.authorization.k8s.io/metrics-server:system:auth-delegator created
+clusterrolebinding.rbac.authorization.k8s.io/system:metrics-server created
+service/metrics-server created
+deployment.apps/metrics-server created
+apiservice.apiregistration.k8s.io/v1beta1.metrics.k8s.io created
+
+
+# 使用kubectl top命令可以查询资源使用情况
+[root@master ~]# kubectl top node
+NAME     CPU(cores)   CPU%   MEMORY(bytes)   MEMORY%   
+master   83m          4%     842Mi           22%       
+node1    20m          1%     316Mi           8%        
+node2    22m          1%     322Mi           8%        
+```
+
+#### 2.4.2、准备测试服务
+
+- 注意在所有node节点上上传镜像文件cpu_stress_v3.tar.gz，使用docker load加载一下
+
+```bash
+[root@master ~]# cat stress.yaml 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stress
+  template:
+    metadata:
+      labels:
+        app: stress
+    spec:
+      containers:
+      - name: stress
+        image: cpu_stress:v3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 80
+        # 定义一个资源请求和限制
+        resources:
+          requests:
+            cpu: "100m"
+          limits:
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stress
+spec:
+  ports:
+  - port: 80
+    targetPort: 80
+  selector: 
+    app: stress
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f stress.yaml 
+deployment.apps/stress created
+service/stress created
+```
+
+#### 2.4.3、命令行配置HPA
+
+```bash
+# --cpu-percent：指定pod的cpu使用率维持在50%左右，超过就扩容小于就缩容
+# --min：指定Pod数量最少多少
+# --max：指定Pod数量最多多少
+# 以西为的deployment资源stress进行配置
+[root@master ~]# kubectl autoscale deployment stress --cpu-percent=50 --min=1 --max=10
+horizontalpodautoscaler.autoscaling/stress autoscaled
+
+
+# 查看hpa
+[root@master ~]# kubectl get hpa
+NAME     REFERENCE           TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+stress   Deployment/stress   0%/50%    1         10        1          74s
+```
+
+#### 2.4.4、编写yaml文件配置HPA
+
+```bash
+# scaleTargetRef：指定要缩放的目标，在这里是“stress”这个Dployment
+# minReplicas：1缩放的最小的Pod的数量
+# maxReplicas：10缩放的最大的Pod的数量
+[root@master ~]# cat stress_hap.yaml 
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: stress
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment # 目标资源类型为Deployment
+    name: stress    # 目标Deployment的名称为stress
+  minReplicas: 1	# 表示Pod的缩放最小数量
+  maxReplicas: 10   # 表示Pod的增加最大数量
+  metrics:
+  - type: Resource	# 指定要缩放所用的资源类型，这里是资源利用率指标
+    resource:
+      name: cpu		# 指定资源类型，这里是CPU
+      target:
+        type: Utilization	# 表示基于CPU利用率百分比来自动扩缩容
+        averageUtilization: 50  # 平均利用率为50%。当利用率超过这个目标值时会缩放Pod的数量
+
+
+# 部署资源（可能会出现一个警告的信息，没有关系不影响）
+[root@master ~]# kubectl apply -f stress_hap.yaml 
+horizontalpodautoscaler.autoscaling/stress created
+
+
+[root@master ~]# kubectl get hpa
+NAME     REFERENCE           TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+stress   Deployment/stress   0%/50%    1         10        1          3m56s
+```
+
+#### 2.4.5、HPA测试
+
+```bash
+[root@master ~]# cat test.yaml 
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpustress
+spec:
+  replicas: 1
+  selector:
+    matchLabels: 
+      app: cpustress
+  template:
+    metadata:
+      labels:
+        app: cpustress
+    spec:
+      containers:
+      - name: cpustress
+        image: alpine
+        imagePullPolicy: IfNotPresent
+        command:
+        - "sh"
+        - "-c"
+        - "sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && apk update && apk add curl && while true; do curl stress/stress?duration=30&load=70 ;sleep 32;done"
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f test.yaml 
+deployment.apps/cpustress created
+
+
+# 查看HPA情况
+[root@master ~]# kubectl get hpa
+NAME     REFERENCE           TARGETS   MINPODS   MAXPODS   REPLICAS   AGE
+stress   Deployment/stress   62%/50%   1         10        10         12m
+
+
+# 查看Pod的是否增加
+[root@master ~]# kubectl get pod
+NAME                         READY   STATUS    RESTARTS   AGE
+cpustress-649d7f6485-6dxrr   1/1     Running   0          3m
+stress-548b54ff89-457cx      1/1     Running   0          2m1s
+stress-548b54ff89-4hstr      1/1     Running   0          2m1s
+stress-548b54ff89-877d9      1/1     Running   0          2m1s
+stress-548b54ff89-9hg62      1/1     Running   0          2m16s
+stress-548b54ff89-b9qnl      1/1     Running   0          23m
+stress-548b54ff89-bblxr      1/1     Running   0          2m16s
+stress-548b54ff89-fnwt5      1/1     Running   0          106s
+stress-548b54ff89-k2dkw      1/1     Running   0          2m1s
+stress-548b54ff89-mdklt      1/1     Running   0          106s
+stress-548b54ff89-xn4tc      1/1     Running   0          2m16s
+
+
+# 停止压力测试
+[root@master ~]# kubectl delete -f test.yaml 
+deployment.apps "cpustress" deleted
+
+
+# 等待一段时间会发现Pod的数量降下来了，可能需要几分钟
+[root@master ~]# kubectl get pod
+NAME                      READY   STATUS    RESTARTS   AGE
+stress-548b54ff89-b9qnl   1/1     Running   0          66m
+```
+
+## 三、节点选择器
+
+### 3.1、通过nodeSelector
+
+- nodeSelector是节点选择约束的最简单的推荐形式。你可以将nodeSelector字段添加到Pod的规约中设置你希望目标节点所具有的节点标签。Kubernetes只会将Pod踢调度到拥有你所指定的每个标签的节点上。
+
+```bash
+# 该示例是运行Pod在具有disk=ceph标签的节点上
+[root@master ~]# cat pod_nodeSelector.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podnodeselector
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  nodeSelector:
+    disk: ceph
+  containers:
+  - name: podnodeselector
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests:
+        memory: "100Mi"
+        cpu: "500m"
+      limits:
+        memory: "1Gi"
+        cpu: "1"  
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f pod_nodeSelector.yaml 
+pod/podnodeselector created
+
+
+# 可以看到没有节点带有disk=ceph标签，所以Pod是Pending状态
+[root@master ~]# kubectl get pod
+NAME                      READY   STATUS    RESTARTS   AGE
+podnodeselector           0/1     Pending   0          56s
+stress-548b54ff89-b9qnl   1/1     Running   0          73m
+[root@master ~]# kubectl get node -l disk=ceph
+No resources found
+
+
+# 给node1节点打标签，然后Pod就自动运行在有指定标签的节点了
+[root@master ~]# kubectl label node node1 disk=ceph
+node/node1 labeled
+[root@master ~]# kubectl get node -l disk=ceph
+NAME    STATUS   ROLES    AGE     VERSION
+node1   Ready    <none>   6d18h   v1.23.0
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE    IP           NODE    NOMINATED NODE   READINESS GATES
+podnodeselector           1/1     Running   0          2m4s   10.244.2.8   node1   <none>           <none>
+
+```
+
+### 3.2、通过nodeName
+
+- nodeName是比性和性或者nodeSelector更为直接的形式。nodeName是Pod规约中的一个字段。如果nodeName字段不为空，调度器会忽略该Pod，而指定节点上的kubelet会尝试将Pod放到该节点上。使用nodeName规则的优先级会高于使用nodeSelector或亲和性与非亲和性的规则。
+
+​		**使用nodeName来选择节点的方式有一些局限性**
+
+- 如果所指定的节点不存在，则Pod无法运行，而且在某些情况下会被自动删除。
+- 如果所指定的节点无法提供用来运行Pod所需的资源，Pod会失败，而其失败原因中会给出是否因为内存或CPU不足而造成无法运行
+- 在云环境中的节点名称并不总是可预测的，也不总是稳定的
+
+```bash
+[root@master ~]# cat nodeName.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: podnodename
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  nodeName: node1
+  containers:
+  - name: podnodename
+    image: nginx
+    imagePullPolicy: IfNotPresent
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nodeName.yaml 
+pod/podnodename created
+
+
+# 查看是否调度到指定节点
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE     IP           NODE    NOMINATED NODE   READINESS GATES
+podnodename               1/1     Running   0          31s     10.244.2.9   node1   <none>           <none>
+```
+
+## 四、亲和性
+
+- Affinity翻译成中文是“亲和性”，它对应的是Anti-Affinity，我们翻译成“互斥”。这两个词比较形象，可以把pod选择node的过程比成磁铁的吸引和互斥，不同的是除了简单的正负极之外，pod和node的吸引和互斥是可以灵活配置的。
+
+​		**Affinity的优点**
+
+- 匹配有更多的逻辑组合，不只是字符串的完成相等
+- 调度分为软策略和硬策略，在软策略下，如果没有满足调度条件的节点，node会忽略这条规则，继续完成调度
+
+​		**目前主要的node affinity：**
+
+- **requiredDuringSchedulingIgnoredDuringExecution**：表示Pod必须部署到满足条件的节点上，如果没有满足条件的节点，就不停重试。其中IgnoreDuringExecution表示Pod部署之后运行的时候，如果节点标签发生了变化，不再满足Pod指定的条件，Pod也会继续运行
+- **requiredDuringSchedulingRequiredDuringExecution**：表示Pod必须部署到满足条件的节点上，如果没有满足条件的节点。就不听重试。其中RequitredDuringExecution表示Pod部署之后运行的时候，如果节点标签发生了变化，不再满足Pod的指定的条件，则重新选择符合要求的节点
+
+- **preferredDuringSchedulingRequiredDuringExecution**：表示优先部署到满足的节点上，如果没有满足条件的节点，就忽略这些条件，按照正常逻辑部署，其中RequitredDuringExecution表示如果后面节点标签发生了变化，满足了条件，则重新调度到满足条件的节点
+
+### 4.1、Node亲和性
+
+- node节点亲和性调度：nodeAffinity
+- 使用requiredDuringSchedulingIgnoredDuringExecution硬亲和性节点有disktype=ssd标签或disktype=hhd标签即可被调度，若是都没有Pod则是Pending状态
+
+```bash
+[root@master ~]# cat podAffinity.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-node-affinity-demo
+  namespace: default
+  labels:
+    app01: nginx
+spec:
+  containers:
+  - name: nginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+           - key: disktype
+             operator: In
+             values:
+             - ssh
+             - hhd
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f podAffinity.yaml 
+pod/pod-node-affinity-demo created
+
+
+# 查看pod状态时Pending，因为没有节点带有disktyp=ssd标签或者disktype=hhd标签
+[root@master ~]# kubectl get pod 
+NAME                      READY   STATUS    RESTARTS   AGE
+pod-node-affinity-demo    0/1     Pending   0          61s
+[root@master ~]# kubectl get node -l disktype=ssd
+No resources found
+[root@master ~]# kubectl get node -l disktype=hhd
+No resources found
+
+
+# 打标签以后发现Pod就正常运行了，并且是运行在打标签的节点上
+[root@master ~]# kubectl label node node1 disktype=ssh
+node/node1 labeled
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE    IP            NODE    NOMINATED NODE   READINESS GATES
+pod-node-affinity-demo    1/1     Running   0          5m6s   10.244.2.10   node1   <none>           <none>
+```
+
+### 4.2、Pod亲和性
+
+​		**Pod自身的亲和性和性调度有两种表示形式：**
+
+- podaffinity：Pod和Pod更倾向于腻在一起，把相近的pod结合到相近的位置，如同一区域，同一机架，这样的话‘pod和pod之间更好通信，比方说有两个机房，这两个机房部署的集群有1000台主机，那么我们希望把nginx和tomcat都部署同一个地方的node节点上，可以提高通信效率
+- poddunaffinity：pod和pod更倾向于不腻在一起，如果部署两台程序，那么这两套程序更倾向于反亲和性，这样相互之间不会有影响
+- 第一个pod随机选择一个节点，作为评判后续的Pod是否到达这个Pod所在的节点上运行方式，这就成为Pod亲和性；我们怎么判断哪些节点是相同位置，哪些节点不同位置；我们在定义pod亲和性时需要有一个提前，哪些pod在同一位置，哪些pod不在同一位置，这个位置是怎么定义的，标准是什么？以节点名称为标准，这个节点相同表示是同一个位置，节点名称不相同的表示不是一个位置
+
+​		**topplogyKey：**
+
+- 位置拓扑的键，这个是必须字段
+- 怎么判断是不是同一个位置
+- rack=rack1
+- row=row1
+- 使用rack的键是同一个位置
+- 使用row的键是同一个位置
+
+​		**labelsSelector：**
+
+- 我们要判断pod跟别的pod亲和，跟哪个pod亲和，需要靠labelSelector，通过labelSelector选择一组作为亲和对象的pod资源
+
+​		**namspace：**
+
+- labelSelector：需要选择一组资源，那么这组资源是在哪个名称空间中呢，通过namespace指定，如果不指定namespace，那么就是当前创建的Pod 的名称空间
+
+#### 4.2.1、Pod亲和
+
+- Pod亲和就是后启动的Pod要和前面启动的Pod调度在一个节点上，使用podAffinity字段定义
+
+```bash
+[root@master ~]# cat podAffinity.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx01
+  namespace: default
+  labels:
+    app01: nginx01
+spec:
+  containers:
+  - name: mynginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx02
+  namespace: default
+  labels:
+    app02: nginx02
+spec:
+  containers:
+  - name: mynginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+  affinity:
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app01
+              operator: In
+              values:
+              - nginx01
+        topologyKey: kubernetes.io/hostname # 每个节点都有kubernetes.io/hostname标签，这个标签通常是主机名，topologKey制定了这个标签意思是限定在一个节点上
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f podAffinity.yaml 
+pod/nginx01 created
+pod/nginx02 created
+
+
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE    IP            NODE    NOMINATED NODE   READINESS GATES
+nginx01                   1/1     Running   0          33s    10.244.1.16   node2   <none>           <none>
+nginx02                   1/1     Running   0          33s    10.244.1.15   node2   <none>           <none>
+```
+
+#### 4.2.2、Pod反亲和
+
+- Pod反亲和就是后启动的Pod要和前面启动的Pod不调度在一个节点上，使用podAntiAffinity字段定义
+
+```bash
+[root@master ~]# cat podAntiAffinity.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx01
+  namespace: default
+  labels:
+    app01: nginx01
+spec:
+  containers:
+  - name: mynginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx02
+  namespace: default
+  labels:
+    app02: nginx02
+spec:
+  containers:
+  - name: mynginx
+    ports:
+      - containerPort: 80
+    image: nginx
+    imagePullPolicy: IfNotPresent
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app01
+              operator: In
+              values:
+              - nginx01
+        topologyKey: kubernetes.io/hostname 
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f podAntiAffinity.yaml 
+pod/nginx01 created
+pod/nginx02 created
+
+
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE    IP            NODE    NOMINATED NODE   READINESS GATES
+nginx01                   1/1     Running   0          36s    10.244.1.19   node2   <none>           <none>
+nginx02                   1/1     Running   0          36s    10.244.2.11   node1   <none>           <none>
+```
+
+## 五、五点容忍
+
+- 节点亲和性是Pod的一种属性，它使Pod被吸引到一类特定的节点（这可能处于一种偏好，也可能是硬性要求）。污点（Taint）则相反——它使节点能够排斥一类特定的Pod。
+- 容忍度（Toeration）是应用于Pod上的。容忍度允许调度器调度带有对应污点的Pod容忍度允许调度并不保存调度：作为其功能的一部分，调度器也会评估其他参数
+- 污点和容忍度（Toleration）相互配合，可以用来避免Pod被分配到不合适的节点上。每个节点都可以应用一个或多个污点，这表示对于那些不能容器这些污点的Pod。是不会被节点接受的
+
+### 5.1、污点
+
+- 我们给节点打一个污点，不容器的pod就运行不上来了，污点就是定义在节点上的键值属性数据，可以决定拒绝那些pod
+
+- 使用kubeadm安装的Kubernetes集群的master节点默认具有node-role.kubernetes.io/master:NoSchedule污点
+
+  **每个污点有一个key和value作为污点的标签，effect描述污点的作用。当前faint effect支持如下效果：**
+
+- NoSchedule：表示K8S将不会把Pod调度到具有该污点的Node节点上
+
+- PreferNoSchedule：表示K8S将尽量避免把Pod调度到具有该污点的Node节点上
+
+- NoExecyute：表示K8S将不会把Pod调度到具有该污点的Node节点上，同时会将Node上已经存在的Pod驱逐出去
+
+#### 5.1.1、添加污点
+
+```bash
+# 给节点 node1 增加一个污点，它的键名是 key1，键值是 value1，效果是NoSchedule
+[root@master ~]# kubectl taint nodes node1 key1=value1:NoSchedule
+node/node1 tainted
+```
+
+#### 5.1.2、查看污点
+
+```bash
+# 查询 node1 节点污点，找到Taints
+[root@master ~]# kubectl describe node node1 | grep Taints
+Taints:             key1=value1:NoSchedule
+```
+
+#### 5.1.3、删除污点
+
+```bash
+# 去除节点 node1 的污点，它的键名是 key1，键值是value1，效果是NoSchedule
+[root@master ~]# kubectl taint node node1 key1=value1:NoSchedule-
+node/node1 untainted
+```
+
+### 5.2、容忍
+
+- 默认情况下，Pod是不会运行在具有污点的节点上，但是我们可以配置容忍，让Pod运行在这个节点
+
+#### 5.2.1、设置污点
+
+```bash
+[root@master ~]# kubectl get node
+NAME     STATUS   ROLES                  AGE     VERSION
+master   Ready    control-plane,master   6d19h   v1.23.0
+node1    Ready    <none>                 6d19h   v1.23.0
+node2    Ready    <none>                 6d19h   v1.23.0
+[root@master ~]# kubectl taint node node1 node-type=test:NoSchedule
+node/node1 tainted
+[root@master ~]# kubectl taint node node2 node-type=production:NoSchedule
+node/node2 tainted
+```
+
+#### 5.2.2、运行没有容忍的Pod
+
+```bash
+[root@master ~]# cat nginx-taint.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    ports:
+    - name: http
+      containerPort: 80
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx-taint.yaml 
+pod/nginx created
+
+
+[root@master ~]# kubectl get pod
+NAME                      READY   STATUS    RESTARTS   AGE
+nginx                     0/1     Pending   0          29s
+
+
+# 使用describe查询
+[root@master ~]# kubectl describe pod nginx
+Name:         nginx
+Namespace:    default
+Priority:     0
+Node:         <none>
+Labels:       app=nginx
+Annotations:  <none>
+Status:       Pending
+IP:           
+IPs:          <none>
+Containers:
+  nginx:
+    Image:        nginx
+    Port:         80/TCP
+    Host Port:    0/TCP
+    Environment:  <none>
+    Mounts:
+      /var/run/secrets/kubernetes.io/serviceaccount from kube-api-access-48d2z (ro)
+Conditions:
+  Type           Status
+  PodScheduled   False 
+Volumes:
+  kube-api-access-48d2z:
+    Type:                    Projected (a volume that contains injected data from multiple sources)
+    TokenExpirationSeconds:  3607
+    ConfigMapName:           kube-root-ca.crt
+    ConfigMapOptional:       <nil>
+    DownwardAPI:             true
+QoS Class:                   BestEffort
+Node-Selectors:              <none>
+Tolerations:                 node.kubernetes.io/not-ready:NoExecute op=Exists for 300s
+                             node.kubernetes.io/unreachable:NoExecute op=Exists for 300s
+Events:
+  Type     Reason            Age   From               Message
+  ----     ------            ----  ----               -------
+#################################################################### 
+  Warning  FailedScheduling  51s   default-scheduler  0/3 nodes are available: 1 node(s) had taint {node-role.kubernetes.io/master: }, that the pod didn't tolerate, 1 node(s) had taint {node-type: production}, that the pod didn't tolerate, 1 node(s) had taint {node-type: test}, that the pod didn't tolerate.
+####################################################################
+```
+
+#### 5.2.3、运行带有容忍的Pod
+
+```bash
+[root@master ~]# cat nginx-taint.yaml 
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nginx
+  namespace: default
+  labels:
+    app: nginx
+spec:
+  containers:
+  - name: nginx
+    image: nginx
+    ports:
+    - name: http
+      containerPort: 80
+    # 容忍key是node-type，value是production，污点级NoSchedule的污点
+  tolerations:
+  - key: "node-type"
+    operator: "Equal"
+    value: "production"
+    effect: "NoSchedule"
+
+
+# 部署资源
+[root@master ~]# kubectl apply -f nginx-taint.yaml 
+pod/nginx configured
+
+
+# 因为该Pod定义了容忍node-type=production:NoSchedule污点所以可以在node2节点运行
+[root@master ~]# kubectl get pod -o wide
+NAME                      READY   STATUS    RESTARTS   AGE     IP            NODE    NOMINATED NODE   READINESS GATES
+nginx                     1/1     Running   0          4m31s   10.244.1.20   node2   <none>           <none>
+```
+
+```bash
+# 只要对应的键是存在的，exists，其值被自动定义成通配符
+tolerations:
+- key: "node-type"
+  operator: "Exists"
+  value: ""
+  effect: "NoSchedule
+```
+
+```bash
+# 有一个node-type的键，不管值是什么，不管是什么效果，都能容忍
+tolerations:
+- key: "node-type"
+  operator: "Exists"
+  value: ""
+  effect: ""
+```
+
